@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-#
 # Copyright 2013 Cloudbase Solutions Srl
 # All Rights Reserved.
 #
@@ -16,68 +14,36 @@
 #    under the License.
 
 import os
-import shutil
+import six
+import tempfile
+import time
 
-from eventlet.green import subprocess
-from nova.openstack.common import log as logging
-from oslo.config import cfg
+from os_win.utils import pathutils
+from oslo_log import log as logging
+
+import nova.conf
+from nova import exception
+from nova.i18n import _
+from nova.virt.hyperv import constants
 
 LOG = logging.getLogger(__name__)
 
-hyperv_opts = [
-    cfg.StrOpt('instances_path_share',
-               default="",
-               help='The name of a Windows share name mapped to the '
-                    '"instances_path" dir and used by the resize feature '
-                    'to copy files to the target host. If left blank, an '
-                    'administrative share will be used, looking for the same '
-                    '"instances_path" used locally'),
-]
+CONF = nova.conf.CONF
 
-CONF = cfg.CONF
-CONF.register_opts(hyperv_opts, 'hyperv')
-CONF.import_opt('instances_path', 'nova.compute.manager')
+ERROR_INVALID_NAME = 123
+
+# NOTE(claudiub): part of the pre-existing PathUtils is nova-specific and
+# it does not belong in the os-win library. In order to ensure the same
+# functionality with the least amount of changes necessary, adding as a mixin
+# the os_win.pathutils.PathUtils class into this PathUtils.
 
 
-class PathUtils(object):
-    def open(self, path, mode):
-        """Wrapper on __builin__.open used to simplify unit testing."""
-        import __builtin__
-        return __builtin__.open(path, mode)
-
-    def exists(self, path):
-        return os.path.exists(path)
-
-    def makedirs(self, path):
-        os.makedirs(path)
-
-    def remove(self, path):
-        os.remove(path)
-
-    def rename(self, src, dest):
-        os.rename(src, dest)
-
-    def copyfile(self, src, dest):
-        self.copy(src, dest)
-
-    def copy(self, src, dest):
-        # With large files this is 2x-3x faster than shutil.copy(src, dest),
-        # especially when copying to a UNC target.
-        # shutil.copyfileobj(...) with a proper buffer is better than
-        # shutil.copy(...) but still 20% slower than a shell copy.
-        # It can be replaced with Win32 API calls to avoid the process
-        # spawning overhead.
-        if subprocess.call(['cmd.exe', '/C', 'copy', '/Y', src, dest]):
-            raise IOError(_('The file copy from %(src)s to %(dest)s failed')
-                           % {'src': src, 'dest': dest})
-
-    def rmtree(self, path):
-        shutil.rmtree(path)
+class PathUtils(pathutils.PathUtils):
 
     def get_instances_dir(self, remote_server=None):
         local_instance_path = os.path.normpath(CONF.instances_path)
 
-        if remote_server:
+        if remote_server and not local_instance_path.startswith(r'\\'):
             if CONF.hyperv.instances_path_share:
                 path = CONF.hyperv.instances_path_share
             else:
@@ -88,25 +54,26 @@ class PathUtils(object):
         else:
             return local_instance_path
 
-    def _check_create_dir(self, path):
-        if not self.exists(path):
-            LOG.debug(_('Creating directory: %s') % path)
-            self.makedirs(path)
-
-    def _check_remove_dir(self, path):
-        if self.exists(path):
-            LOG.debug(_('Removing directory: %s') % path)
-            self.rmtree(path)
-
     def _get_instances_sub_dir(self, dir_name, remote_server=None,
                                create_dir=True, remove_dir=False):
         instances_path = self.get_instances_dir(remote_server)
         path = os.path.join(instances_path, dir_name)
-        if remove_dir:
-            self._check_remove_dir(path)
-        if create_dir:
-            self._check_create_dir(path)
-        return path
+        try:
+            if remove_dir:
+                self.check_remove_dir(path)
+            if create_dir:
+                self.check_create_dir(path)
+            return path
+        except WindowsError as ex:
+            if ex.winerror == ERROR_INVALID_NAME:
+                raise exception.AdminRequired(_(
+                    "Cannot access \"%(instances_path)s\", make sure the "
+                    "path exists and that you have the proper permissions. "
+                    "In particular Nova-Compute must not be executed with the "
+                    "builtin SYSTEM account or other accounts unable to "
+                    "authenticate on a remote host.") %
+                    {'instances_path': instances_path})
+            raise
 
     def get_instance_migr_revert_dir(self, instance_name, create_dir=False,
                                      remove_dir=False):
@@ -119,9 +86,56 @@ class PathUtils(object):
         return self._get_instances_sub_dir(instance_name, remote_server,
                                            create_dir, remove_dir)
 
-    def get_vhd_path(self, instance_name):
+    def _lookup_vhd_path(self, instance_name, vhd_path_func,
+                         *args, **kwargs):
+        vhd_path = None
+        for format_ext in ['vhd', 'vhdx']:
+            test_path = vhd_path_func(instance_name, format_ext,
+                                      *args, **kwargs)
+            if self.exists(test_path):
+                vhd_path = test_path
+                break
+        return vhd_path
+
+    def lookup_root_vhd_path(self, instance_name, rescue=False):
+        return self._lookup_vhd_path(instance_name, self.get_root_vhd_path,
+                                     rescue)
+
+    def lookup_configdrive_path(self, instance_name, rescue=False):
+        configdrive_path = None
+        for format_ext in constants.DISK_FORMAT_MAP:
+            test_path = self.get_configdrive_path(instance_name, format_ext,
+                                                  rescue=rescue)
+            if self.exists(test_path):
+                configdrive_path = test_path
+                break
+        return configdrive_path
+
+    def lookup_ephemeral_vhd_path(self, instance_name, eph_name):
+        return self._lookup_vhd_path(instance_name,
+                                     self.get_ephemeral_vhd_path,
+                                     eph_name)
+
+    def get_root_vhd_path(self, instance_name, format_ext, rescue=False):
         instance_path = self.get_instance_dir(instance_name)
-        return os.path.join(instance_path, 'root.vhd')
+        image_name = 'root'
+        if rescue:
+            image_name += '-rescue'
+        return os.path.join(instance_path,
+                            image_name + '.' + format_ext.lower())
+
+    def get_configdrive_path(self, instance_name, format_ext,
+                             remote_server=None, rescue=False):
+        instance_path = self.get_instance_dir(instance_name, remote_server)
+        configdrive_image_name = 'configdrive'
+        if rescue:
+            configdrive_image_name += '-rescue'
+        return os.path.join(instance_path,
+                            configdrive_image_name + '.' + format_ext.lower())
+
+    def get_ephemeral_vhd_path(self, instance_name, format_ext, eph_name):
+        instance_path = self.get_instance_dir(instance_name)
+        return os.path.join(instance_path, eph_name + '.' + format_ext.lower())
 
     def get_base_vhd_dir(self):
         return self._get_instances_sub_dir('_base')
@@ -130,3 +144,59 @@ class PathUtils(object):
         dir_name = os.path.join('export', instance_name)
         return self._get_instances_sub_dir(dir_name, create_dir=True,
                                            remove_dir=True)
+
+    def get_vm_console_log_paths(self, instance_name, remote_server=None):
+        instance_dir = self.get_instance_dir(instance_name,
+                                             remote_server)
+        console_log_path = os.path.join(instance_dir, 'console.log')
+        return console_log_path, console_log_path + '.1'
+
+    def copy_vm_console_logs(self, instance_name, dest_host):
+        local_log_paths = self.get_vm_console_log_paths(
+            instance_name)
+        remote_log_paths = self.get_vm_console_log_paths(
+            instance_name, remote_server=dest_host)
+
+        for local_log_path, remote_log_path in zip(local_log_paths,
+                                                   remote_log_paths):
+            if self.exists(local_log_path):
+                self.copy(local_log_path, remote_log_path)
+
+    def get_image_path(self, image_name):
+        # Note: it is possible that the path doesn't exist
+        base_dir = self.get_base_vhd_dir()
+        for ext in ['vhd', 'vhdx']:
+            file_path = os.path.join(base_dir,
+                                     image_name + '.' + ext.lower())
+            if self.exists(file_path):
+                return file_path
+        return None
+
+    def get_age_of_file(self, file_name):
+        return time.time() - os.path.getmtime(file_name)
+
+    def check_dirs_shared_storage(self, src_dir, dest_dir):
+        # Check if shared storage is being used by creating a temporary
+        # file at the destination path and checking if it exists at the
+        # source path.
+        LOG.debug("Checking if %(src_dir)s and %(dest_dir)s point "
+                  "to the same location.",
+                  dict(src_dir=src_dir, dest_dir=dest_dir))
+
+        try:
+            with tempfile.NamedTemporaryFile(dir=dest_dir) as tmp_file:
+                src_path = os.path.join(src_dir,
+                                        os.path.basename(tmp_file.name))
+                shared_storage = os.path.exists(src_path)
+        except OSError as e:
+            raise exception.FileNotFound(six.text_type(e))
+
+        return shared_storage
+
+    def check_remote_instances_dir_shared(self, dest):
+        # Checks if the instances dir from a remote host points
+        # to the same storage location as the local instances dir.
+        local_inst_dir = self.get_instances_dir()
+        remote_inst_dir = self.get_instances_dir(dest)
+        return self.check_dirs_shared_storage(local_inst_dir,
+                                              remote_inst_dir)

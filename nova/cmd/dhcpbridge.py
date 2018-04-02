@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -20,36 +18,34 @@
 Handle lease database updates from DHCP servers.
 """
 
+from __future__ import print_function
+
 import os
 import sys
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
 
+from nova.cmd import common as cmd_common
+from nova.conductor import rpcapi as conductor_rpcapi
+import nova.conf
 from nova import config
 from nova import context
-from nova import db
 from nova.network import rpcapi as network_rpcapi
-from nova.openstack.common import importutils
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import rpc
+from nova import objects
+from nova.objects import base as objects_base
+from nova import rpc
 
-CONF = cfg.CONF
-CONF.import_opt('host', 'nova.netconf')
-CONF.import_opt('network_manager', 'nova.service')
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 
 def add_lease(mac, ip_address):
     """Set the IP that was assigned by the DHCP server."""
-    if CONF.fake_rabbit:
-        LOG.debug(_("leasing ip"))
-        network_manager = importutils.import_object(CONF.network_manager)
-        network_manager.lease_fixed_ip(context.get_admin_context(),
-                                       ip_address)
-    else:
-        api = network_rpcapi.NetworkAPI()
-        api.lease_fixed_ip(context.get_admin_context(), ip_address, CONF.host)
+    api = network_rpcapi.NetworkAPI()
+    api.lease_fixed_ip(context.get_admin_context(), ip_address, CONF.host)
 
 
 def old_lease(mac, ip_address):
@@ -62,38 +58,37 @@ def old_lease(mac, ip_address):
 
 def del_lease(mac, ip_address):
     """Called when a lease expires."""
-    if CONF.fake_rabbit:
-        LOG.debug(_("releasing ip"))
-        network_manager = importutils.import_object(CONF.network_manager)
-        network_manager.release_fixed_ip(context.get_admin_context(),
-                                         ip_address)
-    else:
-        api = network_rpcapi.NetworkAPI()
-        api.release_fixed_ip(context.get_admin_context(), ip_address,
-                             CONF.host)
+    api = network_rpcapi.NetworkAPI()
+    api.release_fixed_ip(context.get_admin_context(), ip_address,
+                         CONF.host, mac)
 
 
 def init_leases(network_id):
     """Get the list of hosts for a network."""
     ctxt = context.get_admin_context()
-    network_ref = db.network_get(ctxt, network_id)
+    network = objects.Network.get_by_id(ctxt, network_id)
     network_manager = importutils.import_object(CONF.network_manager)
-    return network_manager.get_dhcp_leases(ctxt, network_ref)
+    return network_manager.get_dhcp_leases(ctxt, network)
 
 
 def add_action_parsers(subparsers):
-    parser = subparsers.add_parser('init')
+    subparsers.add_parser('init')
 
     # NOTE(cfb): dnsmasq always passes mac, and ip. hostname
     #            is passed if known. We don't care about
     #            hostname, but argparse will complain if we
     #            do not accept it.
-    for action in ['add', 'del', 'old']:
+    actions = {
+        'add': add_lease,
+        'del': del_lease,
+        'old': old_lease,
+    }
+    for action, func in actions.items():
         parser = subparsers.add_parser(action)
         parser.add_argument('mac')
         parser.add_argument('ip')
         parser.add_argument('hostname', nargs='?', default='')
-        parser.set_defaults(func=globals()[action + '_lease'])
+        parser.set_defaults(func=func)
 
 
 CONF.register_cli_opt(
@@ -105,32 +100,38 @@ CONF.register_cli_opt(
 
 def main():
     """Parse environment and arguments and call the appropriate action."""
-    try:
-        config_file = os.environ['CONFIG_FILE']
-    except KeyError:
-        config_file = os.environ['FLAGFILE']
-
     config.parse_args(sys.argv,
-        default_config_files=jsonutils.loads(config_file))
+        default_config_files=jsonutils.loads(os.environ['CONFIG_FILE']))
 
-    logging.setup("nova")
+    logging.setup(CONF, "nova")
     global LOG
     LOG = logging.getLogger('nova.dhcpbridge')
 
-    if CONF.action.name in ['add', 'del', 'old']:
-        msg = (_("Called '%(action)s' for mac '%(mac)s' with ip '%(ip)s'") %
-               {"action": CONF.action.name,
-                "mac": CONF.action.mac,
-                "ip": CONF.action.ip})
-        LOG.debug(msg)
+    if CONF.action.name == 'old':
+        # NOTE(sdague): old is the most frequent message sent, and
+        # it's a noop. We should just exit immediately otherwise we
+        # can stack up a bunch of requests in dnsmasq. A SIGHUP seems
+        # to dump this list, so actions queued up get lost.
+        return
+
+    objects.register_all()
+
+    cmd_common.block_db_access('nova-dhcpbridge')
+    objects_base.NovaObject.indirection_api = conductor_rpcapi.ConductorAPI()
+
+    if CONF.action.name in ['add', 'del']:
+        LOG.debug("Called '%(action)s' for mac '%(mac)s' with IP '%(ip)s'",
+                  {"action": CONF.action.name,
+                   "mac": CONF.action.mac,
+                   "ip": CONF.action.ip})
         CONF.action.func(CONF.action.mac, CONF.action.ip)
     else:
         try:
             network_id = int(os.environ.get('NETWORK_ID'))
         except TypeError:
-            LOG.error(_("Environment variable 'NETWORK_ID' must be set."))
-            return(1)
+            LOG.error("Environment variable 'NETWORK_ID' must be set.")
+            return 1
 
-        print init_leases(network_id)
+        print(init_leases(network_id))
 
     rpc.cleanup()

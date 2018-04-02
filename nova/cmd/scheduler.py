@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -20,22 +18,39 @@
 
 import sys
 
-from oslo.config import cfg
+from oslo_concurrency import processutils
+from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
+import nova.conf
 from nova import config
-from nova.openstack.common import log as logging
+from nova import objects
+from nova.scheduler import rpcapi as scheduler_rpcapi
 from nova import service
 from nova import utils
+from nova import version
 
-CONF = cfg.CONF
-CONF.import_opt('scheduler_topic', 'nova.scheduler.rpcapi')
+CONF = nova.conf.CONF
 
 
 def main():
     config.parse_args(sys.argv)
-    logging.setup("nova")
+    logging.setup(CONF, "nova")
     utils.monkey_patch()
+    objects.register_all()
+    gmr_opts.set_defaults(CONF)
+    objects.Service.enable_min_version_cache()
+
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
+
     server = service.Service.create(binary='nova-scheduler',
-                                    topic=CONF.scheduler_topic)
-    service.serve(server)
+                                    topic=scheduler_rpcapi.RPC_TOPIC)
+    # Determine the number of workers; if not specified in config, default
+    # to ncpu for the FilterScheduler and 1 for everything else.
+    workers = CONF.scheduler.workers
+    if not workers:
+        workers = (processutils.get_worker_count()
+                   if CONF.scheduler.driver == 'filter_scheduler' else 1)
+    service.serve(server, workers=workers)
     service.wait()

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,51 +13,56 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+
 from webob import exc
 
 from nova.api.openstack import common
+from nova.api.openstack.compute.schemas import server_metadata
 from nova.api.openstack import wsgi
+from nova.api import validation
 from nova import compute
 from nova import exception
+from nova.i18n import _
+from nova.policies import server_metadata as sm_policies
 
 
-class Controller(object):
+class ServerMetadataController(wsgi.Controller):
     """The server metadata API controller for the OpenStack API."""
 
     def __init__(self):
         self.compute_api = compute.API()
-        super(Controller, self).__init__()
+        super(ServerMetadataController, self).__init__()
 
     def _get_metadata(self, context, server_id):
+        server = common.get_instance(self.compute_api, context, server_id)
         try:
-            server = self.compute_api.get(context, server_id)
+            # NOTE(mikal): get_instance_metadata sometimes returns
+            # InstanceNotFound in unit tests, even though the instance is
+            # fetched on the line above. I blame mocking.
             meta = self.compute_api.get_instance_metadata(context, server)
         except exception.InstanceNotFound:
             msg = _('Server does not exist')
             raise exc.HTTPNotFound(explanation=msg)
-
         meta_dict = {}
-        for key, value in meta.iteritems():
+        for key, value in meta.items():
             meta_dict[key] = value
         return meta_dict
 
-    @wsgi.serializers(xml=common.MetadataTemplate)
+    @wsgi.expected_errors(404)
     def index(self, req, server_id):
         """Returns the list of metadata for a given instance."""
         context = req.environ['nova.context']
+        context.can(sm_policies.POLICY_ROOT % 'index')
         return {'metadata': self._get_metadata(context, server_id)}
 
-    @wsgi.serializers(xml=common.MetadataTemplate)
-    @wsgi.deserializers(xml=common.MetadataDeserializer)
+    @wsgi.expected_errors((403, 404, 409))
+    # NOTE(gmann): Returns 200 for backwards compatibility but should be 201
+    # as this operation complete the creation of metadata.
+    @validation.schema(server_metadata.create)
     def create(self, req, server_id, body):
-        try:
-            metadata = body['metadata']
-        except (KeyError, TypeError):
-            msg = _("Malformed request body")
-            raise exc.HTTPBadRequest(explanation=msg)
-
+        metadata = body['metadata']
         context = req.environ['nova.context']
-
+        context.can(sm_policies.POLICY_ROOT % 'create')
         new_metadata = self._update_instance_metadata(context,
                                                       server_id,
                                                       metadata,
@@ -67,24 +70,16 @@ class Controller(object):
 
         return {'metadata': new_metadata}
 
-    @wsgi.serializers(xml=common.MetaItemTemplate)
-    @wsgi.deserializers(xml=common.MetaItemDeserializer)
+    @wsgi.expected_errors((400, 403, 404, 409))
+    @validation.schema(server_metadata.update)
     def update(self, req, server_id, id, body):
-        try:
-            meta_item = body['meta']
-        except (TypeError, KeyError):
-            expl = _('Malformed request body')
-            raise exc.HTTPBadRequest(explanation=expl)
-
+        context = req.environ['nova.context']
+        context.can(sm_policies.POLICY_ROOT % 'update')
+        meta_item = body['meta']
         if id not in meta_item:
             expl = _('Request body and URI mismatch')
             raise exc.HTTPBadRequest(explanation=expl)
 
-        if len(meta_item) > 1:
-            expl = _('Request body contains too many items')
-            raise exc.HTTPBadRequest(explanation=expl)
-
-        context = req.environ['nova.context']
         self._update_instance_metadata(context,
                                        server_id,
                                        meta_item,
@@ -92,16 +87,12 @@ class Controller(object):
 
         return {'meta': meta_item}
 
-    @wsgi.serializers(xml=common.MetadataTemplate)
-    @wsgi.deserializers(xml=common.MetadataDeserializer)
+    @wsgi.expected_errors((403, 404, 409))
+    @validation.schema(server_metadata.update_all)
     def update_all(self, req, server_id, body):
-        try:
-            metadata = body['metadata']
-        except (TypeError, KeyError):
-            expl = _('Malformed request body')
-            raise exc.HTTPBadRequest(explanation=expl)
-
         context = req.environ['nova.context']
+        context.can(sm_policies.POLICY_ROOT % 'update_all')
+        metadata = body['metadata']
         new_metadata = self._update_instance_metadata(context,
                                                       server_id,
                                                       metadata,
@@ -111,41 +102,31 @@ class Controller(object):
 
     def _update_instance_metadata(self, context, server_id, metadata,
                                   delete=False):
+        server = common.get_instance(self.compute_api, context, server_id)
         try:
-            server = self.compute_api.get(context, server_id)
             return self.compute_api.update_instance_metadata(context,
                                                              server,
                                                              metadata,
                                                              delete)
 
-        except exception.InstanceNotFound:
-            msg = _('Server does not exist')
-            raise exc.HTTPNotFound(explanation=msg)
-
-        except (ValueError, AttributeError):
-            msg = _("Malformed request body")
-            raise exc.HTTPBadRequest(explanation=msg)
-
-        except exception.InvalidMetadata as error:
-            raise exc.HTTPBadRequest(explanation=error.format_message())
-
-        except exception.InvalidMetadataSize as error:
-            raise exc.HTTPRequestEntityTooLarge(
-                explanation=error.format_message())
+        except exception.InstanceUnknownCell as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
 
         except exception.QuotaError as error:
-            raise exc.HTTPRequestEntityTooLarge(
-                explanation=error.format_message(),
-                headers={'Retry-After': 0})
+            raise exc.HTTPForbidden(explanation=error.format_message())
+
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
 
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'update metadata')
+                    'update metadata', server_id)
 
-    @wsgi.serializers(xml=common.MetaItemTemplate)
+    @wsgi.expected_errors(404)
     def show(self, req, server_id, id):
         """Return a single metadata item."""
         context = req.environ['nova.context']
+        context.can(sm_policies.POLICY_ROOT % 'show')
         data = self._get_metadata(context, server_id)
 
         try:
@@ -154,29 +135,28 @@ class Controller(object):
             msg = _("Metadata item was not found")
             raise exc.HTTPNotFound(explanation=msg)
 
+    @wsgi.expected_errors((404, 409))
     @wsgi.response(204)
     def delete(self, req, server_id, id):
         """Deletes an existing metadata."""
         context = req.environ['nova.context']
-
+        context.can(sm_policies.POLICY_ROOT % 'delete')
         metadata = self._get_metadata(context, server_id)
 
         if id not in metadata:
             msg = _("Metadata item was not found")
             raise exc.HTTPNotFound(explanation=msg)
 
+        server = common.get_instance(self.compute_api, context, server_id)
         try:
-            server = self.compute_api.get(context, server_id)
             self.compute_api.delete_instance_metadata(context, server, id)
 
-        except exception.InstanceNotFound:
-            msg = _('Server does not exist')
-            raise exc.HTTPNotFound(explanation=msg)
+        except exception.InstanceUnknownCell as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
+
+        except exception.InstanceIsLocked as e:
+            raise exc.HTTPConflict(explanation=e.format_message())
 
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
-                    'delete metadata')
-
-
-def create_resource():
-    return wsgi.Resource(Controller())
+                    'delete metadata', server_id)

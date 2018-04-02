@@ -1,6 +1,5 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Red Hat, Inc.
+# Copyright 2017 Rackspace Australia
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,15 +13,19 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import grp
 import os
+import pwd
 import tempfile
 
+from oslo_log import log as logging
+from oslo_utils import excutils
+
 from nova import exception
-from nova.openstack.common import excutils
-from nova.openstack.common import log as logging
-from nova import utils
-from nova.virt.disk.mount import loop
-from nova.virt.disk.mount import nbd
+from nova.i18n import _
+import nova.privsep.fs
+import nova.privsep.path
+from nova.virt.disk.mount import api as mount_api
 from nova.virt.disk.vfs import api as vfs
 
 LOG = logging.getLogger(__name__)
@@ -30,8 +33,7 @@ LOG = logging.getLogger(__name__)
 
 class VFSLocalFS(vfs.VFS):
 
-    """
-    os.path.join() with safety check for injected file paths.
+    """os.path.join() with safety check for injected file paths.
 
     Join the supplied path components and make sure that the
     resulting path we are injecting into is within the
@@ -39,10 +41,7 @@ class VFSLocalFS(vfs.VFS):
     path with '..' in it will hit this safeguard.
     """
     def _canonical_path(self, path):
-        canonpath, _err = utils.execute(
-            'readlink', '-nm',
-            os.path.join(self.imgdir, path.lstrip("/")),
-            run_as_root=True)
+        canonpath = nova.privsep.path.readlink(path)
         if not canonpath.startswith(os.path.realpath(self.imgdir) + '/'):
             raise exception.Invalid(_('File path %s not valid') % path)
         return canonpath
@@ -55,31 +54,32 @@ class VFSLocalFS(vfs.VFS):
     raw, it will use the loopback mount impl, otherwise it will
     use the qemu-nbd impl.
     """
-    def __init__(self, imgfile, imgfmt="raw", partition=None, imgdir=None):
-        super(VFSLocalFS, self).__init__(imgfile, imgfmt, partition)
+    def __init__(self, image, partition=None, imgdir=None):
+        """Create a new local VFS instance
+
+        :param image: instance of nova.virt.image.model.Image
+        :param partition: the partition number of access
+        :param imgdir: the directory to mount the image at
+        """
+
+        super(VFSLocalFS, self).__init__(image, partition)
 
         self.imgdir = imgdir
         self.mount = None
 
-    def setup(self):
+    def setup(self, mount=True):
         self.imgdir = tempfile.mkdtemp(prefix="openstack-vfs-localfs")
         try:
-            if self.imgfmt == "raw":
-                LOG.debug(_("Using LoopMount"))
-                mount = loop.LoopMount(self.imgfile,
-                                       self.imgdir,
-                                       self.partition)
-            else:
-                LOG.debug(_("Using NbdMount"))
-                mount = nbd.NbdMount(self.imgfile,
-                                     self.imgdir,
-                                     self.partition)
-            if not mount.do_mount():
-                raise exception.NovaException(mount.error)
-            self.mount = mount
+            mnt = mount_api.Mount.instance_for_format(self.image,
+                                                      self.imgdir,
+                                                      self.partition)
+            if mount:
+                if not mnt.do_mount():
+                    raise exception.NovaException(mnt.error)
+            self.mount = mnt
         except Exception as e:
             with excutils.save_and_reraise_exception():
-                LOG.debug(_("Failed to mount image %(ex)s)"), {'ex': str(e)})
+                LOG.debug("Failed to mount image: %(ex)s", {'ex': e})
                 self.teardown()
 
     def teardown(self):
@@ -87,72 +87,61 @@ class VFSLocalFS(vfs.VFS):
             if self.mount:
                 self.mount.do_teardown()
         except Exception as e:
-            LOG.debug(_("Failed to unmount %(imgdir)s: %(ex)s") %
-                      {'imgdir': self.imgdir, 'ex': str(e)})
+            LOG.debug("Failed to unmount %(imgdir)s: %(ex)s",
+                      {'imgdir': self.imgdir, 'ex': e})
         try:
             if self.imgdir:
                 os.rmdir(self.imgdir)
         except Exception as e:
-            LOG.debug(_("Failed to remove %(imgdir)s: %(ex)s") %
-                      {'imgdir': self.imgdir, 'ex': str(e)})
+            LOG.debug("Failed to remove %(imgdir)s: %(ex)s",
+                      {'imgdir': self.imgdir, 'ex': e})
         self.imgdir = None
         self.mount = None
 
     def make_path(self, path):
-        LOG.debug(_("Make directory path=%(path)s") % locals())
-        canonpath = self._canonical_path(path)
-        utils.execute('mkdir', '-p', canonpath, run_as_root=True)
+        LOG.debug("Make directory path=%s", path)
+        nova.privsep.path.makedirs(self._canonical_path(path))
 
     def append_file(self, path, content):
-        LOG.debug(_("Append file path=%(path)s") % locals())
-        canonpath = self._canonical_path(path)
-
-        args = ["-a", canonpath]
-        kwargs = dict(process_input=content, run_as_root=True)
-
-        utils.execute('tee', *args, **kwargs)
+        LOG.debug("Append file path=%s", path)
+        return nova.privsep.path.writefile(
+            self._canonical_path(path), 'a', content)
 
     def replace_file(self, path, content):
-        LOG.debug(_("Replace file path=%(path)s") % locals())
-        canonpath = self._canonical_path(path)
-
-        args = [canonpath]
-        kwargs = dict(process_input=content, run_as_root=True)
-
-        utils.execute('tee', *args, **kwargs)
+        LOG.debug("Replace file path=%s", path)
+        return nova.privsep.path.writefile(
+            self._canonical_path(path), 'w', content)
 
     def read_file(self, path):
-        LOG.debug(_("Read file path=%(path)s") % locals())
-        canonpath = self._canonical_path(path)
-
-        return utils.read_file_as_root(canonpath)
+        LOG.debug("Read file path=%s", path)
+        return nova.privsep.path.readfile(self._canonical_path(path))
 
     def has_file(self, path):
-        LOG.debug(_("Has file path=%(path)s") % locals())
-        canonpath = self._canonical_path(path)
-        exists, _err = utils.trycmd('readlink', '-e',
-                                    canonpath,
-                                    run_as_root=True)
-        return exists
+        # NOTE(mikal): it is deliberate that we don't generate a canonical
+        # path here, as that tests for existance and would raise an exception.
+        LOG.debug("Has file path=%s", path)
+        return nova.privsep.path.path.exists(path)
 
     def set_permissions(self, path, mode):
-        LOG.debug(_("Set permissions path=%(path)s mode=%(mode)o") % locals())
-        canonpath = self._canonical_path(path)
-        utils.execute('chmod', "%o" % mode, canonpath, run_as_root=True)
+        LOG.debug("Set permissions path=%(path)s mode=%(mode)o",
+                  {'path': path, 'mode': mode})
+        nova.privsep.path.chmod(self._canonical_path(path), mode)
 
     def set_ownership(self, path, user, group):
-        LOG.debug(_("Set permissions path=%(path)s "
-                    "user=%(user)s group=%(group)s") % locals())
+        LOG.debug("Set permissions path=%(path)s "
+                  "user=%(user)s group=%(group)s",
+                  {'path': path, 'user': user, 'group': group})
         canonpath = self._canonical_path(path)
-        owner = None
-        cmd = "chown"
-        if group is not None and user is not None:
-            owner = user + ":" + group
-        elif user is not None:
-            owner = user
-        elif group is not None:
-            owner = group
-            cmd = "chgrp"
 
-        if owner is not None:
-            utils.execute(cmd, owner, canonpath, run_as_root=True)
+        chown_kwargs = {}
+        if user:
+            chown_kwargs['uid'] = pwd.getpwnam(user).pw_uid
+        if group:
+            chown_kwargs['gid'] = grp.getgrnam(group).gr_gid
+        nova.privsep.path.chown(canonpath, **chown_kwargs)
+
+    def get_image_fs(self):
+        if self.mount.device or self.mount.get_dev():
+            out, err = nova.privsep.fs.get_filesystem_type(self.mount.device)
+            return out.strip()
+        return ""

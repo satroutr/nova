@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -19,34 +17,25 @@
 """Eventlet WSGI Services to proxy VNC for XCP protocol."""
 
 import socket
-import webob
 
 import eventlet
 import eventlet.green
 import eventlet.greenio
 import eventlet.wsgi
-from oslo.config import cfg
+from oslo_log import log as logging
+import webob
 
+import nova.conf
 from nova.consoleauth import rpcapi as consoleauth_rpcapi
 from nova import context
-from nova.openstack.common import log as logging
+from nova.i18n import _LI
+from nova import utils
 from nova import version
 from nova import wsgi
 
 
 LOG = logging.getLogger(__name__)
-
-xvp_proxy_opts = [
-    cfg.IntOpt('xvpvncproxy_port',
-               default=6081,
-               help='Port that the XCP VNC proxy should bind to'),
-    cfg.StrOpt('xvpvncproxy_host',
-               default='0.0.0.0',
-               help='Address that the XCP VNC proxy should bind to'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(xvp_proxy_opts)
+CONF = nova.conf.CONF
 
 
 class XCPVNCProxy(object):
@@ -92,12 +81,13 @@ class XCPVNCProxy(object):
                     data += b
                     if data.find("\r\n\r\n") != -1:
                         if not data.split("\r\n")[0].find("200"):
-                            LOG.audit(_("Error in handshake: %s"), data)
+                            LOG.info(_LI("Error in handshake format: %s"),
+                                     data)
                             return
                         break
 
                 if not b or len(data) > 4096:
-                    LOG.audit(_("Error in handshake: %s"), data)
+                    LOG.info(_LI("Error in handshake: %s"), data)
                     return
 
         client = req.environ['eventlet.input'].get_socket()
@@ -108,11 +98,11 @@ class XCPVNCProxy(object):
     def proxy_connection(self, req, connect_info, start_response):
         """Spawn bi-directional vnc proxy."""
         sockets = {}
-        t0 = eventlet.spawn(self.handshake, req, connect_info, sockets)
+        t0 = utils.spawn(self.handshake, req, connect_info, sockets)
         t0.wait()
 
         if not sockets.get('client') or not sockets.get('server'):
-            LOG.audit(_("Invalid request: %s"), req)
+            LOG.info(_LI("Invalid request: %s"), req)
             start_response('400 Invalid Request',
                            [('content-type', 'text/html')])
             return "Invalid Request"
@@ -120,8 +110,8 @@ class XCPVNCProxy(object):
         client = sockets['client']
         server = sockets['server']
 
-        t1 = eventlet.spawn(self.one_way_proxy, client, server)
-        t2 = eventlet.spawn(self.one_way_proxy, server, client)
+        t1 = utils.spawn(self.one_way_proxy, client, server)
+        t2 = utils.spawn(self.one_way_proxy, server, client)
         t1.wait()
         t2.wait()
 
@@ -132,10 +122,10 @@ class XCPVNCProxy(object):
     def __call__(self, environ, start_response):
         try:
             req = webob.Request(environ)
-            LOG.audit(_("Request: %s"), req)
+            LOG.info(_LI("Request: %s"), req)
             token = req.params.get('token')
             if not token:
-                LOG.audit(_("Request made with missing token: %s"), req)
+                LOG.info(_LI("Request made with missing token: %s"), req)
                 start_response('400 Invalid Request',
                                [('content-type', 'text/html')])
                 return "Invalid Request"
@@ -145,14 +135,14 @@ class XCPVNCProxy(object):
             connect_info = api.check_token(ctxt, token)
 
             if not connect_info:
-                LOG.audit(_("Request made with invalid token: %s"), req)
+                LOG.info(_LI("Request made with invalid token: %s"), req)
                 start_response('401 Not Authorized',
                                [('content-type', 'text/html')])
                 return "Not Authorized"
 
             return self.proxy_connection(req, connect_info, start_response)
         except Exception as e:
-            LOG.audit(_("Unexpected error: %s"), e)
+            LOG.info(_LI("Unexpected error: %s"), e)
 
 
 class SafeHttpProtocol(eventlet.wsgi.HttpProtocol):
@@ -172,11 +162,11 @@ class SafeHttpProtocol(eventlet.wsgi.HttpProtocol):
 
 
 def get_wsgi_server():
-    LOG.audit(_("Starting nova-xvpvncproxy node (version %s)"),
+    LOG.info(_LI("Starting nova-xvpvncproxy node (version %s)"),
               version.version_string_with_package())
 
     return wsgi.Server("XCP VNC Proxy",
                        XCPVNCProxy(),
                        protocol=SafeHttpProtocol,
-                       host=CONF.xvpvncproxy_host,
-                       port=CONF.xvpvncproxy_port)
+                       host=CONF.vnc.xvpvncproxy_host,
+                       port=CONF.vnc.xvpvncproxy_port)

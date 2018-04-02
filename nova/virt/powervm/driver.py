@@ -1,6 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-# Copyright 2013 IBM Corp.
+# Copyright 2014, 2018 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -13,109 +11,324 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+"""Connection to PowerVM hypervisor through NovaLink."""
 
-import socket
-import time
+from oslo_log import log as logging
+from oslo_utils import excutils
+from pypowervm import adapter as pvm_apt
+from pypowervm import const as pvm_const
+from pypowervm import exceptions as pvm_exc
+from pypowervm.helpers import log_helper as log_hlp
+from pypowervm.helpers import vios_busy as vio_hlp
+from pypowervm.tasks import partition as pvm_par
+from pypowervm.tasks import storage as pvm_stor
+from pypowervm.tasks import vterm as pvm_vterm
+from pypowervm.wrappers import managed_system as pvm_ms
+import six
+from taskflow.patterns import linear_flow as tf_lf
 
-from oslo.config import cfg
-
-from nova.compute import flavors
-from nova.image import glance
-from nova.openstack.common import log as logging
+from nova import conf as cfg
+from nova.console import type as console_type
+from nova import exception as exc
+from nova import image
+from nova.virt import configdrive
 from nova.virt import driver
-from nova.virt.powervm import exception
-from nova.virt.powervm import operator
+from nova.virt.powervm.disk import ssp
+from nova.virt.powervm import host as pvm_host
+from nova.virt.powervm.tasks import base as tf_base
+from nova.virt.powervm.tasks import network as tf_net
+from nova.virt.powervm.tasks import storage as tf_stg
+from nova.virt.powervm.tasks import vm as tf_vm
+from nova.virt.powervm import vm
 
 LOG = logging.getLogger(__name__)
-
-powervm_opts = [
-    cfg.StrOpt('powervm_mgr_type',
-               default='ivm',
-               help='PowerVM manager type (ivm, hmc)'),
-    cfg.StrOpt('powervm_mgr',
-               default=None,
-               help='PowerVM manager host or ip'),
-    cfg.StrOpt('powervm_mgr_user',
-               default=None,
-               help='PowerVM manager user name'),
-    cfg.StrOpt('powervm_mgr_passwd',
-               default=None,
-               help='PowerVM manager user password',
-               secret=True),
-    cfg.StrOpt('powervm_img_remote_path',
-               default='/home/padmin',
-               help='PowerVM image remote path where images will be moved.'
-               ' Make sure this path can fit your biggest image in glance'),
-    cfg.StrOpt('powervm_img_local_path',
-               default='/tmp',
-               help='Local directory to download glance images to.'
-               ' Make sure this path can fit your biggest image in glance')
-    ]
-
 CONF = cfg.CONF
-CONF.register_opts(powervm_opts)
 
 
 class PowerVMDriver(driver.ComputeDriver):
+    """PowerVM NovaLink Implementation of Compute Driver.
 
-    """PowerVM Implementation of Compute Driver."""
+    https://wiki.openstack.org/wiki/PowerVM
+    """
 
     def __init__(self, virtapi):
+        # NOTE(edmondsw) some of these will be dynamic in future, so putting
+        # capabilities on the instance rather than on the class.
+        self.capabilities = {
+            'has_imagecache': False,
+            'supports_recreate': False,
+            'supports_migrate_to_same_host': False,
+            'supports_attach_interface': False,
+            'supports_device_tagging': False,
+            'supports_tagged_attach_interface': False,
+            'supports_tagged_attach_volume': False,
+            'supports_extend_volume': False,
+            'supports_multiattach': False,
+        }
         super(PowerVMDriver, self).__init__(virtapi)
-        self._powervm = operator.PowerVMOperator()
-
-    @property
-    def host_state(self):
-        pass
 
     def init_host(self, host):
-        """Initialize anything that is necessary for the driver to function,
-        including catching up with currently running VM's on the given host.
+        """Initialize anything that is necessary for the driver to function.
+
+        Includes catching up with currently running VMs on the given host.
         """
-        pass
+        # Build the adapter. May need to attempt the connection multiple times
+        # in case the PowerVM management API service is starting.
+        # TODO(efried): Implement async compute service enable/disable like
+        # I73a34eb6e0ca32d03e54d12a5e066b2ed4f19a61
+        self.adapter = pvm_apt.Adapter(
+            pvm_apt.Session(conn_tries=60),
+            helpers=[log_hlp.log_helper, vio_hlp.vios_busy_retry_helper])
+        # Make sure the Virtual I/O Server(s) are available.
+        pvm_par.validate_vios_ready(self.adapter)
+        self.host_wrapper = pvm_ms.System.get(self.adapter)[0]
+
+        # Do a scrub of the I/O plane to make sure the system is in good shape
+        LOG.info("Clearing stale I/O connections on driver init.")
+        pvm_stor.ComprehensiveScrub(self.adapter).execute()
+
+        # Initialize the disk adapter
+        # TODO(efried): Other disk adapters (localdisk), by conf selection.
+        self.disk_dvr = ssp.SSPDiskAdapter(self.adapter,
+                                           self.host_wrapper.uuid)
+        self.image_api = image.API()
+
+        LOG.info("The PowerVM compute driver has been initialized.")
+
+    @staticmethod
+    def _log_operation(op, instance):
+        """Log entry point of driver operations."""
+        LOG.info('Operation: %(op)s. Virtual machine display name: '
+                 '%(display_name)s, name: %(name)s',
+                 {'op': op, 'display_name': instance.display_name,
+                  'name': instance.name}, instance=instance)
 
     def get_info(self, instance):
-        """Get the current status of an instance."""
-        return self._powervm.get_info(instance['name'])
+        """Get the current status of an instance.
 
-    def get_num_instances(self):
-        return len(self.list_instances())
-
-    def instance_exists(self, instance_name):
-        return self._powervm.instance_exists(instance_name)
+        :param instance: nova.objects.instance.Instance object
+        :returns: An InstanceInfo object.
+        """
+        return vm.get_vm_info(self.adapter, instance)
 
     def list_instances(self):
-        return self._powervm.list_instances()
+        """Return the names of all the instances known to the virt host.
 
-    def get_host_stats(self, refresh=False):
-        """Return currently known host stats."""
-        return self._powervm.get_host_stats(refresh=refresh)
+        :return: VM Names as a list.
+        """
+        return vm.get_lpar_names(self.adapter)
 
-    def get_host_uptime(self, host):
-        """Returns the result of calling "uptime" on the target host."""
-        return self._powervm.get_host_uptime(host)
+    def get_available_nodes(self, refresh=False):
+        """Returns nodenames of all nodes managed by the compute service.
 
-    def plug_vifs(self, instance, network_info):
-        pass
+        This method is for multi compute-nodes support. If a driver supports
+        multi compute-nodes, this method returns a list of nodenames managed
+        by the service. Otherwise, this method should return
+        [hypervisor_hostname].
+        """
 
-    def macs_for_instance(self, instance):
-        return self._powervm.macs_for_instance(instance)
+        return [CONF.host]
+
+    def get_available_resource(self, nodename):
+        """Retrieve resource information.
+
+        This method is called when nova-compute launches, and as part of a
+        periodic task.
+
+        :param nodename: Node from which the caller wants to get resources.
+                         A driver that manages only one node can safely ignore
+                         this.
+        :return: Dictionary describing resources.
+        """
+        # TODO(efried): Switch to get_inventory, per blueprint
+        #               custom-resource-classes-pike
+        # Do this here so it refreshes each time this method is called.
+        self.host_wrapper = pvm_ms.System.get(self.adapter)[0]
+        # Get host information
+        data = pvm_host.build_host_resource_from_ms(self.host_wrapper)
+
+        # Add the disk information
+        data["local_gb"] = self.disk_dvr.capacity
+        data["local_gb_used"] = self.disk_dvr.capacity_used
+
+        return data
 
     def spawn(self, context, instance, image_meta, injected_files,
-              admin_password, network_info=None, block_device_info=None):
-        """Create a new instance/VM/domain on powerVM."""
-        self._powervm.spawn(context, instance, image_meta['id'], network_info)
+              admin_password, allocations, network_info=None,
+              block_device_info=None):
+        """Create a new instance/VM/domain on the virtualization platform.
 
-    def destroy(self, instance, network_info, block_device_info=None,
+        Once this successfully completes, the instance should be
+        running (power_state.RUNNING).
+
+        If this fails, any partial instance should be completely
+        cleaned up, and the virtualization platform should be in the state
+        that it was before this call began.
+
+        :param context: security context
+        :param instance: nova.objects.instance.Instance
+                         This function should use the data there to guide
+                         the creation of the new instance.
+        :param nova.objects.ImageMeta image_meta:
+            The metadata of the image of the instance.
+        :param injected_files: User files to inject into instance.
+        :param admin_password: Administrator password to set in instance.
+        :param allocations: Information about resources allocated to the
+                            instance via placement, of the form returned by
+                            SchedulerReportClient.get_allocations_for_consumer.
+        :param network_info: instance network information
+        :param block_device_info: Information about block devices to be
+                                  attached to the instance.
+        """
+        self._log_operation('spawn', instance)
+        # Define the flow
+        flow_spawn = tf_lf.Flow("spawn")
+
+        # This FeedTask accumulates VIOS storage connection operations to be
+        # run in parallel. Include both SCSI and fibre channel mappings for
+        # the scrubber.
+        stg_ftsk = pvm_par.build_active_vio_feed_task(
+            self.adapter, xag={pvm_const.XAG.VIO_SMAP, pvm_const.XAG.VIO_FMAP})
+
+        flow_spawn.add(tf_vm.Create(
+            self.adapter, self.host_wrapper, instance, stg_ftsk))
+
+        # Create a flow for the IO
+        flow_spawn.add(tf_net.PlugVifs(
+            self.virtapi, self.adapter, instance, network_info))
+        flow_spawn.add(tf_net.PlugMgmtVif(
+            self.adapter, instance))
+
+        # Create the boot image.
+        flow_spawn.add(tf_stg.CreateDiskForImg(
+            self.disk_dvr, context, instance, image_meta))
+        # Connects up the disk to the LPAR
+        flow_spawn.add(tf_stg.AttachDisk(
+            self.disk_dvr, instance, stg_ftsk=stg_ftsk))
+
+        # If the config drive is needed, add those steps.  Should be done
+        # after all the other I/O.
+        if configdrive.required_by(instance):
+            flow_spawn.add(tf_stg.CreateAndConnectCfgDrive(
+                self.adapter, instance, injected_files, network_info,
+                stg_ftsk, admin_pass=admin_password))
+
+        # Add the transaction manager flow at the end of the 'I/O
+        # connection' tasks. This will run all the connections in parallel.
+        flow_spawn.add(stg_ftsk)
+
+        # Last step is to power on the system.
+        flow_spawn.add(tf_vm.PowerOn(self.adapter, instance))
+
+        # Run the flow.
+        tf_base.run(flow_spawn, instance=instance)
+
+    def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True):
-        """Destroy (shutdown and delete) the specified instance."""
-        self._powervm.destroy(instance['name'], destroy_disks)
+        """Destroy the specified instance from the Hypervisor.
+
+        If the instance is not found (for example if networking failed), this
+        function should still succeed. It's probably a good idea to log a
+        warning in that case.
+
+        :param context: security context
+        :param instance: Instance object as returned by DB layer.
+        :param network_info: instance network information
+        :param block_device_info: Information about block devices that should
+                                  be detached from the instance.
+        :param destroy_disks: Indicates if disks should be destroyed
+        """
+        # TODO(thorst, efried) Add resize checks for destroy
+
+        self._log_operation('destroy', instance)
+
+        def _setup_flow_and_run():
+            # Define the flow
+            flow = tf_lf.Flow("destroy")
+
+            # Power Off the LPAR. If its disks are about to be deleted, issue a
+            # hard shutdown.
+            flow.add(tf_vm.PowerOff(self.adapter, instance,
+                                    force_immediate=destroy_disks))
+
+            # The FeedTask accumulates storage disconnection tasks to be run in
+            # parallel.
+            stg_ftsk = pvm_par.build_active_vio_feed_task(
+                self.adapter, xag=[pvm_const.XAG.VIO_SMAP])
+
+            # Call the unplug VIFs task.  While CNAs get removed from the LPAR
+            # directly on the destroy, this clears up the I/O Host side.
+            flow.add(tf_net.UnplugVifs(self.adapter, instance, network_info))
+
+            # Add the disconnect/deletion of the vOpt to the transaction
+            # manager.
+            if configdrive.required_by(instance):
+                flow.add(tf_stg.DeleteVOpt(
+                    self.adapter, instance, stg_ftsk=stg_ftsk))
+
+            # TODO(thorst, efried) Add volume disconnect tasks
+
+            # Detach the disk storage adapters
+            flow.add(tf_stg.DetachDisk(self.disk_dvr, instance))
+
+            # Accumulated storage disconnection tasks next
+            flow.add(stg_ftsk)
+
+            # Delete the storage disks
+            if destroy_disks:
+                flow.add(tf_stg.DeleteDisk(self.disk_dvr))
+
+            # TODO(thorst, efried) Add LPAR id based scsi map clean up task
+            flow.add(tf_vm.Delete(self.adapter, instance))
+
+            # Build the engine & run!
+            tf_base.run(flow, instance=instance)
+
+        try:
+            _setup_flow_and_run()
+        except exc.InstanceNotFound:
+            LOG.debug('VM was not found during destroy operation.',
+                      instance=instance)
+            return
+        except pvm_exc.Error as e:
+            LOG.exception("PowerVM error during destroy.", instance=instance)
+            # Convert to a Nova exception
+            raise exc.InstanceTerminationFailure(reason=six.text_type(e))
+
+    def power_off(self, instance, timeout=0, retry_interval=0):
+        """Power off the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        :param timeout: time to wait for GuestOS to shutdown
+        :param retry_interval: How often to signal guest while
+                               waiting for it to shutdown
+        """
+        self._log_operation('power_off', instance)
+        force_immediate = (timeout == 0)
+        timeout = timeout or None
+        vm.power_off(self.adapter, instance, force_immediate=force_immediate,
+                     timeout=timeout)
+
+    def power_on(self, context, instance, network_info,
+                 block_device_info=None):
+        """Power on the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
+        self._log_operation('power_on', instance)
+        vm.power_on(self.adapter, instance)
 
     def reboot(self, context, instance, network_info, reboot_type,
                block_device_info=None, bad_volumes_callback=None):
         """Reboot the specified instance.
 
-        :param instance: Instance object as returned by DB layer.
+        After this is called successfully, the instance's state
+        goes back to power_state.RUNNING. The virtualization
+        platform should ensure that the reboot action has completed
+        successfully even in cases in which the underlying domain/vm
+        is paused or halted/stopped.
+
+        :param instance: nova.objects.instance.Instance
         :param network_info:
            :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
         :param reboot_type: Either a HARD or SOFT reboot
@@ -123,217 +336,45 @@ class PowerVMDriver(driver.ComputeDriver):
         :param bad_volumes_callback: Function to handle any bad volumes
             encountered
         """
-        pass
+        self._log_operation(reboot_type + ' reboot', instance)
+        vm.reboot(self.adapter, instance, reboot_type == 'HARD')
+        # pypowervm exceptions are sufficient to indicate real failure.
+        # Otherwise, pypowervm thinks the instance is up.
 
-    def get_host_ip_addr(self):
-        """Retrieves the IP address of the hypervisor host."""
-        LOG.debug(_("In get_host_ip_addr"))
-        # TODO(mrodden): use operator get_hostname instead
-        hostname = CONF.powervm_mgr
-        LOG.debug(_("Attempting to resolve %s") % hostname)
-        ip_addr = socket.gethostbyname(hostname)
-        LOG.debug(_("%(hostname)s was successfully resolved to %(ip_addr)s") %
-                  {'hostname': hostname, 'ip_addr': ip_addr})
-        return ip_addr
-
-    def snapshot(self, context, instance, image_id, update_task_state):
-        """Snapshots the specified instance.
+    def get_vnc_console(self, context, instance):
+        """Get connection info for a vnc console.
 
         :param context: security context
-        :param instance: Instance object as returned by DB layer.
-        :param image_id: Reference to a pre-created image that will
-                         hold the snapshot.
-        :param update_task_state: Function reference that allows for updates
-                                  to the instance task state.
+        :param instance: nova.objects.instance.Instance
+
+        :return: An instance of console.type.ConsoleVNC
         """
-        snapshot_start = time.time()
+        self._log_operation('get_vnc_console', instance)
+        lpar_uuid = vm.get_pvm_uuid(instance)
 
-        # get current image info
-        glance_service, old_image_id = glance.get_remote_image_service(
-                context, instance['image_ref'])
-        image_meta = glance_service.show(context, old_image_id)
-        img_props = image_meta['properties']
+        # Build the connection to the VNC.
+        host = CONF.vnc.server_proxyclient_address
+        # TODO(thorst, efried) Add the x509 certificate support when it lands
 
-        # build updated snapshot metadata
-        snapshot_meta = glance_service.show(context, image_id)
-        new_snapshot_meta = {'is_public': False,
-                             'name': snapshot_meta['name'],
-                             'status': 'active',
-                             'properties': {'image_location': 'snapshot',
-                                            'image_state': 'available',
-                                            'owner_id': instance['project_id']
-                                           },
-                             'disk_format': image_meta['disk_format'],
-                             'container_format': image_meta['container_format']
-                            }
+        try:
+            # Open up a remote vterm
+            port = pvm_vterm.open_remotable_vnc_vterm(
+                self.adapter, lpar_uuid, host, vnc_path=lpar_uuid)
+            # Note that the VNC viewer will wrap the internal_access_path with
+            # the HTTP content.
+            return console_type.ConsoleVNC(host=host, port=port,
+                                           internal_access_path=lpar_uuid)
+        except pvm_exc.HttpError as e:
+            with excutils.save_and_reraise_exception(logger=LOG) as sare:
+                # If the LPAR was not found, raise a more descriptive error
+                if e.response.status == 404:
+                    sare.reraise = False
+                    raise exc.InstanceNotFound(instance_id=instance.uuid)
 
-        # disk capture and glance upload
-        self._powervm.capture_image(context, instance, image_id,
-                                    new_snapshot_meta, update_task_state)
+    def deallocate_networks_on_reschedule(self, instance):
+        """Does the driver want networks deallocated on reschedule?
 
-        snapshot_time = time.time() - snapshot_start
-        inst_name = instance['name']
-        LOG.info(_("%(inst_name)s captured in %(snapshot_time)s seconds"),
-                 {'inst_name': inst_name, 'snapshot_time': snapshot_time})
-
-    def pause(self, instance):
-        """Pause the specified instance."""
-        pass
-
-    def unpause(self, instance):
-        """Unpause paused VM instance."""
-        pass
-
-    def suspend(self, instance):
-        """suspend the specified instance."""
-        pass
-
-    def resume(self, instance, network_info, block_device_info=None):
-        """resume the specified instance."""
-        pass
-
-    def power_off(self, instance):
-        """Power off the specified instance."""
-        self._powervm.power_off(instance['name'])
-
-    def power_on(self, context, instance, network_info,
-                 block_device_info=None):
-        """Power on the specified instance."""
-        self._powervm.power_on(instance['name'])
-
-    def get_available_resource(self, nodename):
-        """Retrieve resource info."""
-        return self._powervm.get_available_resource()
-
-    def host_power_action(self, host, action):
-        """Reboots, shuts down or powers up the host."""
-        pass
-
-    def legacy_nwinfo(self):
+        :param instance: the instance object.
+        :returns: Boolean value. If True deallocate networks on reschedule.
         """
-        Indicate if the driver requires the legacy network_info format.
-        """
-        return False
-
-    def manage_image_cache(self, context, all_instances):
-        """
-        Manage the driver's local image cache.
-
-        Some drivers chose to cache images for instances on disk. This method
-        is an opportunity to do management of that cache which isn't directly
-        related to other calls into the driver. The prime example is to clean
-        the cache and remove images which are no longer of interest.
-        """
-        pass
-
-    def migrate_disk_and_power_off(self, context, instance, dest,
-                                   instance_type, network_info,
-                                   block_device_info=None):
-        """Transfers the disk of a running instance in multiple phases, turning
-           off the instance before the end.
-
-        :returns: disk_info dictionary that is passed as the
-                  disk_info parameter to finish_migration
-                  on the destination nova-compute host
-        """
-        src_host = self.get_host_ip_addr()
-        pvm_op = self._powervm._operator
-        lpar_obj = pvm_op.get_lpar(instance['name'])
-        vhost = pvm_op.get_vhost_by_instance_id(lpar_obj['lpar_id'])
-        diskname = pvm_op.get_disk_name_by_vhost(vhost)
-
-        self._powervm.power_off(instance['name'], timeout=120)
-        # NOTE(ldbragst) Here we need to check if the resize or migrate is
-        # happening on the same host. If yes, then we need to assign a temp
-        # mac address to the source LPAR so we don't have a conflict when
-        # another LPAR is booted with the same mac address as the
-        # original LPAR
-        if src_host == dest:
-            macs = self.macs_for_instance(instance)
-            temp_mac = macs.pop()
-            self._powervm._operator.set_lpar_mac_base_value(instance['name'],
-                                                            temp_mac)
-
-        disk_info = self._powervm.migrate_disk(
-                diskname, src_host, dest, CONF.powervm_img_remote_path,
-                instance['name'])
-        disk_info['old_lv_size'] = pvm_op.get_logical_vol_size(diskname)
-        new_name = self._get_resize_name(instance['name'])
-        pvm_op.rename_lpar(instance['name'], new_name)
-        return disk_info
-
-    def _get_resize_name(self, instance_name):
-        """Rename the instance to be migrated to avoid naming conflicts
-
-        :param instance_name: name of instance to be migrated
-        :returns: the new instance name
-        """
-        name_tag = 'rsz_'
-
-        # if the current name would overflow with new tag
-        if ((len(instance_name) + len(name_tag)) > 31):
-            # remove enough chars for the tag to fit
-            num_chars = len(name_tag)
-            old_name = instance_name[num_chars:]
-        else:
-            old_name = instance_name
-
-        return ''.join([name_tag, old_name])
-
-    def finish_migration(self, context, migration, instance, disk_info,
-                         network_info, image_meta, resize_instance,
-                         block_device_info=None, power_on=True):
-        """Completes a resize, turning on the migrated instance
-
-        :param network_info:
-           :py:meth:`~nova.network.manager.NetworkManager.get_instance_nw_info`
-        :param image_meta: image object returned by nova.image.glance that
-                           defines the image from which this instance
-                           was created
-        """
-        lpar_obj = self._powervm._create_lpar_instance(instance, network_info)
-
-        instance_type = flavors.extract_flavor(instance)
-        new_lv_size = instance_type['root_gb']
-        old_lv_size = disk_info['old_lv_size']
-        if 'root_disk_file' in disk_info:
-            disk_size = max(int(new_lv_size), int(old_lv_size))
-            disk_size_bytes = disk_size * 1024 * 1024 * 1024
-            self._powervm.deploy_from_migrated_file(
-                    lpar_obj, disk_info['root_disk_file'], disk_size_bytes,
-                    power_on)
-        else:
-            # this shouldn't get hit unless someone forgot to handle
-            # a certain migration type
-            raise exception.PowerVMUnrecognizedRootDevice(disk_info=disk_info)
-
-    def confirm_migration(self, migration, instance, network_info):
-        """Confirms a resize, destroying the source VM."""
-
-        new_name = self._get_resize_name(instance['name'])
-        self._powervm.destroy(new_name)
-
-    def finish_revert_migration(self, instance, network_info,
-                                block_device_info=None, power_on=True):
-        """Finish reverting a resize."""
-
-        new_name = self._get_resize_name(instance['name'])
-
-        # NOTE(ldbragst) In the case of a resize_revert on the same host
-        # we reassign the original mac address, replacing the temp mac
-        # on the old instance that will be started
-        if (self._powervm.instance_exists(new_name) and
-                self._powervm.instance_exists(instance['name'])):
-            original_mac = network_info[0]['address']
-            self._powervm._operator.set_lpar_mac_base_value(instance['name'],
-                                                            original_mac)
-        # Make sure we don't have a failed same-host migration still
-        # hanging around
-        if self.instance_exists(new_name):
-            if self.instance_exists(instance['name']):
-                self._powervm.destroy(instance['name'])
-            # undo instance rename and start
-            self._powervm._operator.rename_lpar(new_name, instance['name'])
-
-        if power_on:
-            self._powervm.power_on(instance['name'])
+        return True

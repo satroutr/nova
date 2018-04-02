@@ -18,10 +18,6 @@ Cell scheduler filters
 """
 
 from nova import filters
-from nova.openstack.common import log as logging
-from nova import policy
-
-LOG = logging.getLogger(__name__)
 
 
 class BaseCellFilter(filters.BaseFilter):
@@ -34,9 +30,7 @@ class BaseCellFilter(filters.BaseFilter):
         is the name of the filter class.
         """
         name = 'cells_scheduler_filter:' + self.__class__.__name__
-        target = {'project_id': ctxt.project_id,
-                  'user_id': ctxt.user_id}
-        return policy.enforce(ctxt, name, target, do_raise=False)
+        return ctxt.can(name, fatal=False)
 
     def _filter_one(self, cell, filter_properties):
         return self.cell_passes(cell, filter_properties)

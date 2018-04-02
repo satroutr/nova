@@ -20,5 +20,10 @@ from nova.scheduler import filters
 class AllHostsFilter(filters.BaseHostFilter):
     """NOOP host filter. Returns all hosts."""
 
-    def host_passes(self, host_state, filter_properties):
+    # list of hosts doesn't change within a request
+    run_filter_once_per_request = True
+
+    RUN_ON_REBUILD = False
+
+    def host_passes(self, host_state, spec_obj):
         return True

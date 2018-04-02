@@ -18,28 +18,15 @@ If a child cell hasn't sent capacity or capability updates in a while,
 downgrade its likelihood of being chosen for scheduling requests.
 """
 
-from oslo.config import cfg
+from oslo_log import log as logging
+from oslo_utils import timeutils
 
 from nova.cells import weights
-from nova.openstack.common import log as logging
-from nova.openstack.common import timeutils
+import nova.conf
 
 LOG = logging.getLogger(__name__)
 
-mute_weigher_opts = [
-        cfg.FloatOpt('mute_weight_multiplier',
-                default=-10.0,
-                help='Multiplier used to weigh mute children.  (The value '
-                     'should be negative.)'),
-        cfg.FloatOpt('mute_weight_value',
-                default=1000.0,
-                help='Weight value assigned to mute children.  (The value '
-                     'should be positive.)'),
-]
-
-CONF = cfg.CONF
-CONF.import_opt('mute_child_interval', 'nova.cells.opts', group='cells')
-CONF.register_opts(mute_weigher_opts, group='cells')
+CONF = nova.conf.CONF
 
 
 class MuteChildWeigher(weights.BaseCellWeigher):
@@ -47,7 +34,9 @@ class MuteChildWeigher(weights.BaseCellWeigher):
     weight.
     """
 
-    def _weight_multiplier(self):
+    MUTE_WEIGH_VALUE = 1.0
+
+    def weight_multiplier(self):
         # negative multiplier => lower weight
         return CONF.cells.mute_weight_multiplier
 
@@ -62,8 +51,9 @@ class MuteChildWeigher(weights.BaseCellWeigher):
 
         if timeutils.is_older_than(last_seen, secs):
             # yep, that's a mute child;  recommend highly that it be skipped!
-            LOG.warn(_("%(cell)s has not been seen since %(last_seen)s and is "
-                       "being treated as mute.") % locals())
-            return CONF.cells.mute_weight_value
+            LOG.warning("%(cell)s has not been seen since %(last_seen)s "
+                        "and is being treated as mute.",
+                        {'cell': cell, 'last_seen': last_seen})
+            return self.MUTE_WEIGH_VALUE
         else:
             return 0

@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # Copyright (c) 2013 Hewlett-Packard Development Company, L.P.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# THIS FILE IS MANAGED BY THE GLOBAL REQUIREMENTS REPO - DO NOT EDIT
 import setuptools
 
+# In python < 2.7.4, a lazy loading of package `pbr` will break
+# setuptools if some other modules registered functions in `atexit`.
+# solution from: http://bugs.python.org/issue15881#msg170215
+try:
+    import multiprocessing  # noqa
+except ImportError:
+    pass
+
 setuptools.setup(
-    setup_requires=['d2to1>=0.2.10,<0.3', 'pbr>=0.5,<0.6'],
-    d2to1=True)
+    setup_requires=['pbr>=2.0.0'],
+    pbr=True)

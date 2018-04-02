@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -18,53 +16,45 @@
 
 """Starter script for Nova Compute."""
 
+import shlex
 import sys
-import traceback
 
-from oslo.config import cfg
+import os_vif
+from oslo_log import log as logging
+from oslo_privsep import priv_context
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
+from nova.cmd import common as cmd_common
+from nova.compute import rpcapi as compute_rpcapi
 from nova.conductor import rpcapi as conductor_rpcapi
+import nova.conf
 from nova import config
-import nova.db.api
-from nova import exception
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common import log as logging
 from nova import service
 from nova import utils
+from nova import version
 
-CONF = cfg.CONF
-CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
-CONF.import_opt('use_local', 'nova.conductor.api', group='conductor')
-
-
-def block_db_access():
-    class NoDB(object):
-        def __getattr__(self, attr):
-            return self
-
-        def __call__(self, *args, **kwargs):
-            stacktrace = "".join(traceback.format_stack())
-            LOG = logging.getLogger('nova.compute')
-            LOG.error('No db access allowed in nova-compute: %s' % stacktrace)
-            raise exception.DBNotAllowed('nova-compute')
-
-    nova.db.api.IMPL = NoDB()
+CONF = nova.conf.CONF
 
 
 def main():
-    objects.register_all()
     config.parse_args(sys.argv)
-    logging.setup('nova')
+    logging.setup(CONF, 'nova')
+    priv_context.init(root_helper=shlex.split(utils.get_root_helper()))
     utils.monkey_patch()
+    objects.register_all()
+    gmr_opts.set_defaults(CONF)
+    # Ensure os-vif objects are registered and plugins loaded
+    os_vif.initialize()
 
-    if not CONF.conductor.use_local:
-        block_db_access()
-        objects_base.NovaObject.indirection_api = \
-            conductor_rpcapi.ConductorAPI()
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
 
+    cmd_common.block_db_access('nova-compute')
+    objects_base.NovaObject.indirection_api = conductor_rpcapi.ConductorAPI()
+    objects.Service.enable_min_version_cache()
     server = service.Service.create(binary='nova-compute',
-                                    topic=CONF.compute_topic,
-                                    db_allowed=False)
+                                    topic=compute_rpcapi.RPC_TOPIC)
     service.serve(server)
     service.wait()

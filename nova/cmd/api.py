@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -24,30 +22,50 @@ Starts both the EC2 and OpenStack APIs in separate greenthreads.
 
 import sys
 
-from oslo.config import cfg
+from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
+import nova.conf
 from nova import config
-from nova.openstack.common import log as logging
+from nova import exception
+from nova import objects
 from nova import service
 from nova import utils
+from nova import version
 
-CONF = cfg.CONF
-CONF.import_opt('enabled_apis', 'nova.service')
-CONF.import_opt('enabled_ssl_apis', 'nova.service')
+CONF = nova.conf.CONF
 
 
 def main():
     config.parse_args(sys.argv)
-    logging.setup("nova")
+    logging.setup(CONF, "nova")
     utils.monkey_patch()
+    objects.register_all()
+    gmr_opts.set_defaults(CONF)
+    if 'osapi_compute' in CONF.enabled_apis:
+        # NOTE(mriedem): This is needed for caching the nova-compute service
+        # version.
+        objects.Service.enable_min_version_cache()
+    log = logging.getLogger(__name__)
+
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
 
     launcher = service.process_launcher()
+    started = 0
     for api in CONF.enabled_apis:
         should_use_ssl = api in CONF.enabled_ssl_apis
-        if api == 'ec2':
-            server = service.WSGIService(api, use_ssl=should_use_ssl,
-                                         max_url_len=16384)
-        else:
+        try:
             server = service.WSGIService(api, use_ssl=should_use_ssl)
-        launcher.launch_service(server, workers=server.workers or 1)
+            launcher.launch_service(server, workers=server.workers or 1)
+            started += 1
+        except exception.PasteAppNotFound as ex:
+            log.warning("%s. ``enabled_apis`` includes bad values. "
+                        "Fix to remove this warning.", ex)
+
+    if started == 0:
+        log.error('No APIs were started. '
+                  'Check the enabled_apis config option.')
+        sys.exit(1)
+
     launcher.wait()

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -21,35 +19,29 @@
 Scheduler Service
 """
 
-from oslo.config import cfg
+import collections
 
-from nova.compute import rpcapi as compute_rpcapi
-from nova.compute import task_states
-from nova.compute import utils as compute_utils
-from nova.compute import vm_states
-from nova.conductor import api as conductor_api
-from nova.conductor.tasks import live_migrate
-import nova.context
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_serialization import jsonutils
+from oslo_service import periodic_task
+from stevedore import driver
+
+import nova.conf
 from nova import exception
+from nova.i18n import _LI
 from nova import manager
-from nova.openstack.common import excutils
-from nova.openstack.common import importutils
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import periodic_task
-from nova.openstack.common.rpc import common as rpc_common
+from nova import objects
+from nova.objects import host_mapping as host_mapping_obj
 from nova import quota
-from nova.scheduler import utils as scheduler_utils
+from nova.scheduler import client as scheduler_client
+from nova.scheduler import request_filter
+from nova.scheduler import utils
 
 
 LOG = logging.getLogger(__name__)
 
-scheduler_driver_opt = cfg.StrOpt('scheduler_driver',
-        default='nova.scheduler.filter_scheduler.FilterScheduler',
-        help='Default driver to use for the scheduler')
-
-CONF = cfg.CONF
-CONF.register_opt(scheduler_driver_opt)
+CONF = nova.conf.CONF
 
 QUOTAS = quota.QUOTAS
 
@@ -57,232 +49,158 @@ QUOTAS = quota.QUOTAS
 class SchedulerManager(manager.Manager):
     """Chooses a host to run instances on."""
 
-    RPC_API_VERSION = '2.7'
+    target = messaging.Target(version='4.5')
+
+    _sentinel = object()
 
     def __init__(self, scheduler_driver=None, *args, **kwargs):
+        client = scheduler_client.SchedulerClient()
+        self.placement_client = client.reportclient
         if not scheduler_driver:
-            scheduler_driver = CONF.scheduler_driver
-        self.driver = importutils.import_object(scheduler_driver)
+            scheduler_driver = CONF.scheduler.driver
+        self.driver = driver.DriverManager(
+                "nova.scheduler.driver",
+                scheduler_driver,
+                invoke_on_load=True).driver
         super(SchedulerManager, self).__init__(service_name='scheduler',
                                                *args, **kwargs)
 
-    def post_start_hook(self):
-        """After we start up and can receive messages via RPC, tell all
-        compute nodes to send us their capabilities.
+    @periodic_task.periodic_task(
+        spacing=CONF.scheduler.discover_hosts_in_cells_interval,
+        run_immediately=True)
+    def _discover_hosts_in_cells(self, context):
+        host_mappings = host_mapping_obj.discover_hosts(context)
+        if host_mappings:
+            LOG.info(_LI('Discovered %(count)i new hosts: %(hosts)s'),
+                     {'count': len(host_mappings),
+                      'hosts': ','.join(['%s:%s' % (hm.cell_mapping.name,
+                                                    hm.host)
+                                         for hm in host_mappings])})
+
+    @periodic_task.periodic_task(spacing=CONF.scheduler.periodic_task_interval,
+                                 run_immediately=True)
+    def _run_periodic_tasks(self, context):
+        self.driver.run_periodic_tasks(context)
+
+    @messaging.expected_exceptions(exception.NoValidHost)
+    def select_destinations(self, ctxt, request_spec=None,
+            filter_properties=None, spec_obj=_sentinel, instance_uuids=None,
+            return_objects=False, return_alternates=False):
+        """Returns destinations(s) best suited for this RequestSpec.
+
+        Starting in Queens, this method returns a list of lists of Selection
+        objects, with one list for each requested instance. Each instance's
+        list will have its first element be the Selection object representing
+        the chosen host for the instance, and if return_alternates is True,
+        zero or more alternate objects that could also satisfy the request. The
+        number of alternates is determined by the configuration option
+        `CONF.scheduler.max_attempts`.
+
+        The ability of a calling method to handle this format of returned
+        destinations is indicated by a True value in the parameter
+        `return_objects`. However, there may still be some older conductors in
+        a deployment that have not been updated to Queens, and in that case
+        return_objects will be False, and the result will be a list of dicts
+        with 'host', 'nodename' and 'limits' as keys. When return_objects is
+        False, the value of return_alternates has no effect. The reason there
+        are two kwarg parameters return_objects and return_alternates is so we
+        can differentiate between callers that understand the Selection object
+        format but *don't* want to get alternate hosts, as is the case with the
+        conductors that handle certain move operations.
         """
-        ctxt = nova.context.get_admin_context()
-        compute_rpcapi.ComputeAPI().publish_service_capabilities(ctxt)
+        LOG.debug("Starting to schedule for instances: %s", instance_uuids)
 
-    def update_service_capabilities(self, context, service_name,
-                                    host, capabilities):
-        """Process a capability update from a service node."""
-        if not isinstance(capabilities, list):
-            capabilities = [capabilities]
-        for capability in capabilities:
-            if capability is None:
-                capability = {}
-            self.driver.update_service_capabilities(service_name, host,
-                                                    capability)
+        # TODO(sbauza): Change the method signature to only accept a spec_obj
+        # argument once API v5 is provided.
+        if spec_obj is self._sentinel:
+            spec_obj = objects.RequestSpec.from_primitives(ctxt,
+                                                           request_spec,
+                                                           filter_properties)
 
-    def create_volume(self, context, volume_id, snapshot_id,
-                      reservations=None, image_id=None):
-        #function removed in RPC API 2.3
-        pass
-
-    @rpc_common.client_exceptions(exception.NoValidHost,
-                                  exception.ComputeServiceUnavailable,
-                                  exception.InvalidHypervisorType,
-                                  exception.UnableToMigrateToSelf,
-                                  exception.DestinationHypervisorTooOld,
-                                  exception.InvalidLocalStorage,
-                                  exception.InvalidSharedStorage,
-                                  exception.MigrationPreCheckError)
-    def live_migration(self, context, instance, dest,
-                       block_migration, disk_over_commit):
         try:
-            self._schedule_live_migration(context, instance, dest,
-                    block_migration, disk_over_commit)
-        except (exception.NoValidHost,
-                exception.ComputeServiceUnavailable,
-                exception.InvalidHypervisorType,
-                exception.UnableToMigrateToSelf,
-                exception.DestinationHypervisorTooOld,
-                exception.InvalidLocalStorage,
-                exception.InvalidSharedStorage,
-                exception.MigrationPreCheckError) as ex:
-            request_spec = {'instance_properties': {
-                'uuid': instance['uuid'], },
-            }
-            with excutils.save_and_reraise_exception():
-                self._set_vm_state_and_notify('live_migration',
-                            dict(vm_state=instance['vm_state'],
-                                 task_state=None,
-                                 expected_task_state=task_states.MIGRATING,),
-                                              context, ex, request_spec)
-        except Exception as ex:
-            request_spec = {'instance_properties': {
-                'uuid': instance['uuid'], },
-            }
-            with excutils.save_and_reraise_exception():
-                self._set_vm_state_and_notify('live_migration',
-                                             {'vm_state': vm_states.ERROR},
-                                             context, ex, request_spec)
+            request_filter.process_reqspec(ctxt, spec_obj)
+        except exception.RequestFilterFailed as e:
+            raise exception.NoValidHost(reason=e.message)
 
-    def _schedule_live_migration(self, context, instance, dest,
-            block_migration, disk_over_commit):
-        task = live_migrate.LiveMigrationTask(context, instance,
-                    dest, block_migration, disk_over_commit,
-                    self.driver.select_hosts)
-        return task.execute()
+        resources = utils.resources_from_request_spec(spec_obj)
+        alloc_reqs_by_rp_uuid, provider_summaries, allocation_request_version \
+            = None, None, None
+        if self.driver.USES_ALLOCATION_CANDIDATES:
+            res = self.placement_client.get_allocation_candidates(ctxt,
+                                                                  resources)
+            if res is None:
+                # We have to handle the case that we failed to connect to the
+                # Placement service and the safe_connect decorator on
+                # get_allocation_candidates returns None.
+                alloc_reqs, provider_summaries, allocation_request_version = (
+                        None, None, None)
+            else:
+                (alloc_reqs, provider_summaries,
+                            allocation_request_version) = res
+            if not alloc_reqs:
+                LOG.debug("Got no allocation candidates from the Placement "
+                          "API. This may be a temporary occurrence as compute "
+                          "nodes start up and begin reporting inventory to "
+                          "the Placement service.")
+                raise exception.NoValidHost(reason="")
+            else:
+                # Build a dict of lists of allocation requests, keyed by
+                # provider UUID, so that when we attempt to claim resources for
+                # a host, we can grab an allocation request easily
+                alloc_reqs_by_rp_uuid = collections.defaultdict(list)
+                for ar in alloc_reqs:
+                    for rp_uuid in ar['allocations']:
+                        alloc_reqs_by_rp_uuid[rp_uuid].append(ar)
 
-    def run_instance(self, context, request_spec, admin_password,
-            injected_files, requested_networks, is_first_time,
-            filter_properties):
-        """Tries to call schedule_run_instance on the driver.
-        Sets instance vm_state to ERROR on exceptions
+        # Only return alternates if both return_objects and return_alternates
+        # are True.
+        return_alternates = return_alternates and return_objects
+        selections = self.driver.select_destinations(ctxt, spec_obj,
+                instance_uuids, alloc_reqs_by_rp_uuid, provider_summaries,
+                allocation_request_version, return_alternates)
+        # If `return_objects` is False, we need to convert the selections to
+        # the older format, which is a list of host state dicts.
+        if not return_objects:
+            selection_dicts = [sel[0].to_dict() for sel in selections]
+            return jsonutils.to_primitive(selection_dicts)
+        return selections
+
+    def update_aggregates(self, ctxt, aggregates):
+        """Updates HostManager internal aggregates information.
+
+        :param aggregates: Aggregate(s) to update
+        :type aggregates: :class:`nova.objects.Aggregate`
+                          or :class:`nova.objects.AggregateList`
         """
-        instance_uuids = request_spec['instance_uuids']
-        with compute_utils.EventReporter(context, conductor_api.LocalAPI(),
-                                         'schedule', *instance_uuids):
-            try:
-                return self.driver.schedule_run_instance(context,
-                        request_spec, admin_password, injected_files,
-                        requested_networks, is_first_time, filter_properties)
+        # NOTE(sbauza): We're dropping the user context now as we don't need it
+        self.driver.host_manager.update_aggregates(aggregates)
 
-            except exception.NoValidHost as ex:
-                # don't re-raise
-                self._set_vm_state_and_notify('run_instance',
-                                              {'vm_state': vm_states.ERROR,
-                                              'task_state': None},
-                                              context, ex, request_spec)
-            except Exception as ex:
-                with excutils.save_and_reraise_exception():
-                    self._set_vm_state_and_notify('run_instance',
-                                                  {'vm_state': vm_states.ERROR,
-                                                  'task_state': None},
-                                                  context, ex, request_spec)
+    def delete_aggregate(self, ctxt, aggregate):
+        """Deletes HostManager internal information about a specific aggregate.
 
-    def prep_resize(self, context, image, request_spec, filter_properties,
-                    instance, instance_type, reservations):
-        """Tries to call schedule_prep_resize on the driver.
-        Sets instance vm_state to ACTIVE on NoHostFound
-        Sets vm_state to ERROR on other exceptions
+        :param aggregate: Aggregate to delete
+        :type aggregate: :class:`nova.objects.Aggregate`
         """
-        instance_uuid = instance['uuid']
-        with compute_utils.EventReporter(context, conductor_api.LocalAPI(),
-                                         'schedule', instance_uuid):
-            try:
-                kwargs = {
-                    'context': context,
-                    'image': image,
-                    'request_spec': request_spec,
-                    'filter_properties': filter_properties,
-                    'instance': instance,
-                    'instance_type': instance_type,
-                    'reservations': reservations,
-                }
-                return self.driver.schedule_prep_resize(**kwargs)
-            except exception.NoValidHost as ex:
-                self._set_vm_state_and_notify('prep_resize',
-                                             {'vm_state': vm_states.ACTIVE,
-                                              'task_state': None},
-                                             context, ex, request_spec)
-                if reservations:
-                    QUOTAS.rollback(context, reservations)
-            except Exception as ex:
-                with excutils.save_and_reraise_exception():
-                    self._set_vm_state_and_notify('prep_resize',
-                                                 {'vm_state': vm_states.ERROR,
-                                                  'task_state': None},
-                                                 context, ex, request_spec)
-                    if reservations:
-                        QUOTAS.rollback(context, reservations)
+        # NOTE(sbauza): We're dropping the user context now as we don't need it
+        self.driver.host_manager.delete_aggregate(aggregate)
 
-    def _set_vm_state_and_notify(self, method, updates, context, ex,
-                                 request_spec):
-        scheduler_utils.set_vm_state_and_notify(
-            context, 'scheduler', method, updates, ex, request_spec, self.db)
-
-    # NOTE(hanlind): This method can be removed in v3.0 of the RPC API.
-    def show_host_resources(self, context, host):
-        """Shows the physical/usage resource given by hosts.
-
-        :param context: security context
-        :param host: hostname
-        :returns:
-            example format is below::
-
-                {'resource':D, 'usage':{proj_id1:D, proj_id2:D}}
-                D: {'vcpus': 3, 'memory_mb': 2048, 'local_gb': 2048,
-                    'vcpus_used': 12, 'memory_mb_used': 10240,
-                    'local_gb_used': 64}
-
+    def update_instance_info(self, context, host_name, instance_info):
+        """Receives information about changes to a host's instances, and
+        updates the driver's HostManager with that information.
         """
-        # Getting compute node info and related instances info
-        service_ref = self.db.service_get_by_compute_host(context, host)
-        instance_refs = self.db.instance_get_all_by_host(context,
-                                                         service_ref['host'])
+        self.driver.host_manager.update_instance_info(context, host_name,
+                                                      instance_info)
 
-        # Getting total available/used resource
-        compute_ref = service_ref['compute_node'][0]
-        resource = {'vcpus': compute_ref['vcpus'],
-                    'memory_mb': compute_ref['memory_mb'],
-                    'local_gb': compute_ref['local_gb'],
-                    'vcpus_used': compute_ref['vcpus_used'],
-                    'memory_mb_used': compute_ref['memory_mb_used'],
-                    'local_gb_used': compute_ref['local_gb_used']}
-        usage = dict()
-        if not instance_refs:
-            return {'resource': resource, 'usage': usage}
-
-        # Getting usage resource per project
-        project_ids = [i['project_id'] for i in instance_refs]
-        project_ids = list(set(project_ids))
-        for project_id in project_ids:
-            vcpus = [i['vcpus'] for i in instance_refs
-                     if i['project_id'] == project_id]
-
-            mem = [i['memory_mb'] for i in instance_refs
-                   if i['project_id'] == project_id]
-
-            root = [i['root_gb'] for i in instance_refs
-                    if i['project_id'] == project_id]
-
-            ephemeral = [i['ephemeral_gb'] for i in instance_refs
-                         if i['project_id'] == project_id]
-
-            usage[project_id] = {'vcpus': sum(vcpus),
-                                 'memory_mb': sum(mem),
-                                 'root_gb': sum(root),
-                                 'ephemeral_gb': sum(ephemeral)}
-
-        return {'resource': resource, 'usage': usage}
-
-    @periodic_task.periodic_task
-    def _expire_reservations(self, context):
-        QUOTAS.expire(context)
-
-    # NOTE(russellb) This method can be removed in 3.0 of this API.  It is
-    # deprecated in favor of the method in the base API.
-    def get_backdoor_port(self, context):
-        return self.backdoor_port
-
-    @rpc_common.client_exceptions(exception.NoValidHost)
-    def select_hosts(self, context, request_spec, filter_properties):
-        """Returns host(s) best suited for this request_spec
-        and filter_properties.
+    def delete_instance_info(self, context, host_name, instance_uuid):
+        """Receives information about the deletion of one of a host's
+        instances, and updates the driver's HostManager with that information.
         """
-        hosts = self.driver.select_hosts(context, request_spec,
-            filter_properties)
-        return jsonutils.to_primitive(hosts)
+        self.driver.host_manager.delete_instance_info(context, host_name,
+                                                      instance_uuid)
 
-    @rpc_common.client_exceptions(exception.NoValidHost)
-    def select_destinations(self, context, request_spec, filter_properties):
-        """Returns destinations(s) best suited for this request_spec and
-        filter_properties.
-
-        The result should be a list of (host, nodename) tuples.
+    def sync_instance_info(self, context, host_name, instance_uuids):
+        """Receives a sync request from a host, and passes it on to the
+        driver's HostManager.
         """
-        dests = self.driver.select_destinations(context, request_spec,
-            filter_properties)
-        return jsonutils.to_primitive(dests)
+        self.driver.host_manager.sync_instance_info(context, host_name,
+                                                    instance_uuids)

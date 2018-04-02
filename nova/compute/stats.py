@@ -15,6 +15,7 @@
 
 from nova.compute import task_states
 from nova.compute import vm_states
+from nova.i18n import _
 
 
 class Stats(dict):
@@ -31,6 +32,15 @@ class Stats(dict):
 
         self.states.clear()
 
+    def digest_stats(self, stats):
+        """Apply stats provided as a dict or a json encoded string."""
+        if stats is None:
+            return
+        if isinstance(stats, dict):
+            self.update(stats)
+            return
+        raise ValueError(_('Unexpected type adding stats'))
+
     @property
     def io_workload(self):
         """Calculate an I/O based load by counting I/O heavy operations."""
@@ -45,9 +55,11 @@ class Stats(dict):
         num_resizes = _get(task_states.RESIZE_PREP, "task")
         num_snapshots = _get(task_states.IMAGE_SNAPSHOT, "task")
         num_backups = _get(task_states.IMAGE_BACKUP, "task")
+        num_rescues = _get(task_states.RESCUING, "task")
+        num_unshelves = _get(task_states.UNSHELVING, "task")
 
         return (num_builds + num_rebuilds + num_resizes + num_migrations +
-                num_snapshots + num_backups)
+                num_snapshots + num_backups + num_rescues + num_unshelves)
 
     def calculate_workload(self):
         """Calculate current load of the compute host based on
@@ -71,11 +83,7 @@ class Stats(dict):
         key = "num_os_type_%s" % os_type
         return self.get(key, 0)
 
-    @property
-    def num_vcpus_used(self):
-        return self.get("num_vcpus_used", 0)
-
-    def update_stats_for_instance(self, instance):
+    def update_stats_for_instance(self, instance, is_removed=False):
         """Update stats after an instance is changed."""
 
         uuid = instance['uuid']
@@ -89,34 +97,25 @@ class Stats(dict):
             self._decrement("num_task_%s" % old_state['task_state'])
             self._decrement("num_os_type_%s" % old_state['os_type'])
             self._decrement("num_proj_%s" % old_state['project_id'])
-            x = self.get("num_vcpus_used", 0)
-            self["num_vcpus_used"] = x - old_state['vcpus']
         else:
             # new instance
             self._increment("num_instances")
 
         # Now update stats from the new instance state:
-        (vm_state, task_state, os_type, project_id, vcpus) = \
+        (vm_state, task_state, os_type, project_id) = \
                 self._extract_state_from_instance(instance)
 
-        if vm_state == vm_states.DELETED:
+        if is_removed or vm_state in vm_states.ALLOW_RESOURCE_REMOVAL:
             self._decrement("num_instances")
             self.states.pop(uuid)
-
         else:
             self._increment("num_vm_%s" % vm_state)
             self._increment("num_task_%s" % task_state)
             self._increment("num_os_type_%s" % os_type)
             self._increment("num_proj_%s" % project_id)
-            x = self.get("num_vcpus_used", 0)
-            self["num_vcpus_used"] = x + vcpus
 
         # save updated I/O workload in stats:
         self["io_workload"] = self.io_workload
-
-    def update_stats_for_migration(self, instance_type, sign=1):
-        x = self.get("num_vcpus_used", 0)
-        self["num_vcpus_used"] = x + (sign * instance_type['vcpus'])
 
     def _decrement(self, key):
         x = self.get(key, 0)
@@ -134,10 +133,8 @@ class Stats(dict):
         task_state = instance['task_state']
         os_type = instance['os_type']
         project_id = instance['project_id']
-        vcpus = instance['vcpus']
 
         self.states[uuid] = dict(vm_state=vm_state, task_state=task_state,
-                                 os_type=os_type, project_id=project_id,
-                                 vcpus=vcpus)
+                                 os_type=os_type, project_id=project_id)
 
-        return (vm_state, task_state, os_type, project_id, vcpus)
+        return (vm_state, task_state, os_type, project_id)

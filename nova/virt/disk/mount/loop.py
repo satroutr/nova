@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Red Hat, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,8 +13,10 @@
 # under the License.
 """Support for mounting images with the loop device."""
 
-from nova.openstack.common import log as logging
-from nova import utils
+from oslo_log import log as logging
+
+from nova.i18n import _
+import nova.privsep.fs
 from nova.virt.disk.mount import api
 
 LOG = logging.getLogger(__name__)
@@ -27,17 +27,16 @@ class LoopMount(api.Mount):
     mode = 'loop'
 
     def _inner_get_dev(self):
-        out, err = utils.trycmd('losetup', '--find', '--show', self.image,
-                                run_as_root=True)
+        out, err = nova.privsep.fs.loopsetup(self.image.path)
         if err:
             self.error = _('Could not attach image to loopback: %s') % err
-            LOG.info(_('Loop mount error: %s'), self.error)
+            LOG.info('Loop mount error: %s', self.error)
             self.linked = False
             self.device = None
             return False
 
         self.device = out.strip()
-        LOG.debug(_("Got loop device %s"), self.device)
+        LOG.debug("Got loop device %s", self.device)
         self.linked = True
         return True
 
@@ -55,8 +54,7 @@ class LoopMount(api.Mount):
         # NOTE(mikal): On some kernels, losetup -d will intermittently fail,
         # thus leaking a loop device unless the losetup --detach is retried:
         # https://lkml.org/lkml/2012/9/28/62
-        LOG.debug(_("Release loop device %s"), self.device)
-        utils.execute('losetup', '--detach', self.device, run_as_root=True,
-                      attempts=3)
+        LOG.debug("Release loop device %s", self.device)
+        nova.privsep.fs.loopremove(self.device)
         self.linked = False
         self.device = None

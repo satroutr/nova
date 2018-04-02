@@ -1,6 +1,5 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
+# Copyright 2013 IBM Corp.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,10 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import os.path
+from oslo_utils import strutils
 
 from nova.api.openstack import common
 from nova.image import glance
+from nova import utils
 
 
 class ViewBuilder(common.ViewBuilder):
@@ -72,24 +72,39 @@ class ViewBuilder(common.ViewBuilder):
                 }],
             }
 
+        auto_disk_config = image_dict['metadata'].get("auto_disk_config", None)
+        if auto_disk_config is not None:
+            value = strutils.bool_from_string(auto_disk_config)
+            image_dict["OS-DCF:diskConfig"] = (
+                'AUTO' if value else 'MANUAL')
+
         return dict(image=image_dict)
 
     def detail(self, request, images):
         """Show a list of images with details."""
         list_func = self.show
-        return self._list_view(list_func, request, images)
+        coll_name = self._collection_name + '/detail'
+        return self._list_view(list_func, request, images, coll_name)
 
     def index(self, request, images):
         """Show a list of images with basic attributes."""
         list_func = self.basic
-        return self._list_view(list_func, request, images)
+        coll_name = self._collection_name
+        return self._list_view(list_func, request, images, coll_name)
 
-    def _list_view(self, list_func, request, images):
-        """Provide a view for a list of images."""
+    def _list_view(self, list_func, request, images, coll_name):
+        """Provide a view for a list of images.
+
+        :param list_func: Function used to format the image data
+        :param request: API request
+        :param images: List of images in dictionary format
+        :param coll_name: Name of collection, used to generate the next link
+                          for a pagination query
+
+        :returns: Image reply data in dictionary format
+        """
         image_list = [list_func(request, image)["image"] for image in images]
-        images_links = self._get_collection_links(request,
-                                                  images,
-                                                  self._collection_name)
+        images_links = self._get_collection_links(request, images, coll_name)
         images_dict = dict(images=image_list)
 
         if images_links:
@@ -117,18 +132,18 @@ class ViewBuilder(common.ViewBuilder):
 
     def _get_alternate_link(self, request, identifier):
         """Create an alternate link for a specific image id."""
-        glance_url = glance.generate_glance_url()
+        glance_url = glance.generate_glance_url(
+            request.environ['nova.context'])
         glance_url = self._update_glance_link_prefix(glance_url)
-        return os.path.join(glance_url,
-                            request.environ["nova.context"].project_id,
-                            self._collection_name,
-                            str(identifier))
+        return '/'.join([glance_url,
+                         self._collection_name,
+                         str(identifier)])
 
     @staticmethod
-    def _format_date(date_string):
-        """Return standard format for given date."""
-        if date_string is not None:
-            return date_string.strftime('%Y-%m-%dT%H:%M:%SZ')
+    def _format_date(dt):
+        """Return standard format for a given datetime object."""
+        if dt is not None:
+            return utils.isotime(dt)
 
     @staticmethod
     def _get_status(image):
@@ -149,44 +164,3 @@ class ViewBuilder(common.ViewBuilder):
             "saving": 50,
             "active": 100,
         }.get(image.get("status"), 0)
-
-
-class ViewBuilderV3(ViewBuilder):
-
-    def show(self, request, image):
-        """Return a dictionary with image details."""
-        image_dict = {
-            "id": image.get("id"),
-            "name": image.get("name"),
-            "size": int(image.get("size") or 0),
-            "minRam": int(image.get("min_ram") or 0),
-            "minDisk": int(image.get("min_disk") or 0),
-            "metadata": image.get("properties", {}),
-            "created": self._format_date(image.get("created_at")),
-            "updated": self._format_date(image.get("updated_at")),
-            "status": self._get_status(image),
-            "progress": self._get_progress(image),
-            "links": self._get_links(request,
-                                     image["id"],
-                                     self._collection_name),
-        }
-
-        instance_uuid = image.get("properties", {}).get("instance_uuid")
-
-        if instance_uuid is not None:
-            server_ref = self._get_href_link(request, instance_uuid, 'servers')
-            image_dict["server"] = {
-                "id": instance_uuid,
-                "links": [{
-                    "rel": "self",
-                    "href": server_ref,
-                },
-                {
-                    "rel": "bookmark",
-                    "href": self._get_bookmark_link(request,
-                                                    instance_uuid,
-                                                    'servers'),
-                }],
-            }
-
-        return dict(image=image_dict)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -20,63 +18,32 @@ Websocket proxy that is compatible with OpenStack Nova
 noVNC consoles. Leverages websockify.py by Joel Martin
 """
 
-import os
 import sys
 
-from oslo.config import cfg
 
+from nova.cmd import baseproxy
+import nova.conf
+from nova.conf import vnc
 from nova import config
-from nova.console import websocketproxy
+from nova.console.securityproxy import rfb
 
 
-opts = [
-    cfg.StrOpt('novncproxy_host',
-               default='0.0.0.0',
-               help='Host on which to listen for incoming requests'),
-    cfg.IntOpt('novncproxy_port',
-               default=6080,
-               help='Port on which to listen for incoming requests'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_cli_opts(opts)
-CONF.import_opt('record', 'nova.cmd.novnc')
-CONF.import_opt('daemon', 'nova.cmd.novnc')
-CONF.import_opt('ssl_only', 'nova.cmd.novnc')
-CONF.import_opt('source_is_ipv6', 'nova.cmd.novnc')
-CONF.import_opt('cert', 'nova.cmd.novnc')
-CONF.import_opt('key', 'nova.cmd.novnc')
-CONF.import_opt('web', 'nova.cmd.novnc')
+CONF = nova.conf.CONF
+vnc.register_cli_opts(CONF)
 
 
 def main():
-    # Setup flags
+    # set default web flag option
     CONF.set_default('web', '/usr/share/novnc')
     config.parse_args(sys.argv)
 
-    if CONF.ssl_only and not os.path.exists(CONF.cert):
-        print "SSL only and %s not found" % CONF.cert
-        return(-1)
+    # TODO(stephenfin): Always enable the security proxy once we support RFB
+    # version 3.3, as used in XenServer.
+    security_proxy = None
+    if CONF.compute_driver != 'xenapi.XenAPIDriver':
+        security_proxy = rfb.RFBSecurityProxy()
 
-    # Check to see if novnc html/js/css files are present
-    if not os.path.exists(CONF.web):
-        print "Can not find novnc html/js/css files at %s." % CONF.web
-        return(-1)
-
-    # Create and start the NovaWebSockets proxy
-    server = websocketproxy.NovaWebSocketProxy(
-                                   listen_host=CONF.novncproxy_host,
-                                   listen_port=CONF.novncproxy_port,
-                                   source_is_ipv6=CONF.source_is_ipv6,
-                                   verbose=CONF.verbose,
-                                   cert=CONF.cert,
-                                   key=CONF.key,
-                                   ssl_only=CONF.ssl_only,
-                                   daemon=CONF.daemon,
-                                   record=CONF.record,
-                                   web=CONF.web,
-                                   target_host='ignore',
-                                   target_port='ignore',
-                                   wrap_mode='exit',
-                                   wrap_cmd=None)
-    server.start_server()
+    baseproxy.proxy(
+        host=CONF.vnc.novncproxy_host,
+        port=CONF.vnc.novncproxy_port,
+        security_proxy=security_proxy)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,13 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import webob
 from webob import exc
 
 from nova.api.openstack import wsgi
-from nova.api.openstack import xmlutil
 from nova.console import api as console_api
 from nova import exception
+from nova.policies import consoles as consoles_policies
 
 
 def _translate_keys(cons):
@@ -33,9 +30,7 @@ def _translate_keys(cons):
 
 
 def _translate_detail_keys(cons):
-    """Coerces a console instance into proper dictionary format with
-    correctly mapped attributes.
-    """
+    """Coerces a console instance into proper dictionary format with detail."""
     pool = cons['pool']
     info = {'id': cons['id'],
             'console_type': pool['console_type'],
@@ -46,87 +41,63 @@ def _translate_detail_keys(cons):
     return dict(console=info)
 
 
-class ConsoleTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('console', selector='console')
-
-        id_elem = xmlutil.SubTemplateElement(root, 'id', selector='id')
-        id_elem.text = xmlutil.Selector()
-
-        port_elem = xmlutil.SubTemplateElement(root, 'port', selector='port')
-        port_elem.text = xmlutil.Selector()
-
-        host_elem = xmlutil.SubTemplateElement(root, 'host', selector='host')
-        host_elem.text = xmlutil.Selector()
-
-        passwd_elem = xmlutil.SubTemplateElement(root, 'password',
-                                                 selector='password')
-        passwd_elem.text = xmlutil.Selector()
-
-        constype_elem = xmlutil.SubTemplateElement(root, 'console_type',
-                                                   selector='console_type')
-        constype_elem.text = xmlutil.Selector()
-
-        return xmlutil.MasterTemplate(root, 1)
-
-
-class ConsolesTemplate(xmlutil.TemplateBuilder):
-    def construct(self):
-        root = xmlutil.TemplateElement('consoles')
-        console = xmlutil.SubTemplateElement(root, 'console',
-                                             selector='consoles')
-        console.append(ConsoleTemplate())
-
-        return xmlutil.MasterTemplate(root, 1)
-
-
-class Controller(object):
+class ConsolesController(wsgi.Controller):
     """The Consoles controller for the OpenStack API."""
 
     def __init__(self):
         self.console_api = console_api.API()
 
-    @wsgi.serializers(xml=ConsolesTemplate)
+    @wsgi.expected_errors(())
     def index(self, req, server_id):
         """Returns a list of consoles for this instance."""
+        context = req.environ['nova.context']
+        context.can(consoles_policies.POLICY_ROOT % 'index')
+
         consoles = self.console_api.get_consoles(
-                                    req.environ['nova.context'],
-                                    server_id)
+                req.environ['nova.context'], server_id)
         return dict(consoles=[_translate_keys(console)
                               for console in consoles])
 
-    def create(self, req, server_id):
+    # NOTE(gmann): Here should be 201 instead of 200 by v2.1
+    # +microversions because the console has been created
+    # completely when returning a response.
+    @wsgi.expected_errors(404)
+    def create(self, req, server_id, body):
         """Creates a new console."""
-        self.console_api.create_console(
-                                req.environ['nova.context'],
-                                server_id)
+        context = req.environ['nova.context']
+        context.can(consoles_policies.POLICY_ROOT % 'create')
 
-    @wsgi.serializers(xml=ConsoleTemplate)
+        try:
+            self.console_api.create_console(
+                req.environ['nova.context'], server_id)
+        except exception.InstanceNotFound as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
+
+    @wsgi.expected_errors(404)
     def show(self, req, server_id, id):
         """Shows in-depth information on a specific console."""
+        context = req.environ['nova.context']
+        context.can(consoles_policies.POLICY_ROOT % 'show')
+
         try:
             console = self.console_api.get_console(
                                         req.environ['nova.context'],
                                         server_id,
                                         int(id))
-        except exception.NotFound:
-            raise exc.HTTPNotFound()
+        except exception.ConsoleNotFound as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())
         return _translate_detail_keys(console)
 
-    def update(self, req, server_id, id):
-        """You can't update a console."""
-        raise exc.HTTPNotImplemented()
-
+    @wsgi.response(202)
+    @wsgi.expected_errors(404)
     def delete(self, req, server_id, id):
         """Deletes a console."""
+        context = req.environ['nova.context']
+        context.can(consoles_policies.POLICY_ROOT % 'delete')
+
         try:
             self.console_api.delete_console(req.environ['nova.context'],
                                             server_id,
                                             int(id))
-        except exception.NotFound:
-            raise exc.HTTPNotFound()
-        return webob.Response(status_int=202)
-
-
-def create_resource():
-    return wsgi.Resource(Controller())
+        except exception.ConsoleNotFound as e:
+            raise exc.HTTPNotFound(explanation=e.format_message())

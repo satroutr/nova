@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2010 OpenStack Foundation
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -23,32 +21,38 @@ Chance (Random) Scheduler implementation
 
 import random
 
-from oslo.config import cfg
+from oslo_log import log as logging
 
 from nova.compute import rpcapi as compute_rpcapi
+import nova.conf
 from nova import exception
+from nova.i18n import _
+from nova import objects
 from nova.scheduler import driver
-from nova.scheduler import host_manager
 
-CONF = cfg.CONF
-CONF.import_opt('compute_topic', 'nova.compute.rpcapi')
+CONF = nova.conf.CONF
+LOG = logging.getLogger(__name__)
 
 
 class ChanceScheduler(driver.Scheduler):
     """Implements Scheduler as a random node selector."""
 
+    USES_ALLOCATION_CANDIDATES = False
+
     def __init__(self, *args, **kwargs):
         super(ChanceScheduler, self).__init__(*args, **kwargs)
-        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
+        LOG.warning('ChanceScheduler is deprecated in Pike and will be '
+                    'removed in a subsequent release.')
 
-    def _filter_hosts(self, request_spec, hosts, filter_properties):
-        """Filter a list of hosts based on request_spec."""
+    def _filter_hosts(self, hosts, spec_obj):
+        """Filter a list of hosts based on RequestSpec."""
 
-        ignore_hosts = filter_properties.get('ignore_hosts', [])
+        ignore_hosts = spec_obj.ignore_hosts or []
         hosts = [host for host in hosts if host not in ignore_hosts]
         return hosts
 
-    def _schedule(self, context, topic, request_spec, filter_properties):
+    def _schedule(self, context, topic, spec_obj, instance_uuids,
+            return_alternates=False):
         """Picks a host that is up at random."""
 
         elevated = context.elevated()
@@ -57,71 +61,64 @@ class ChanceScheduler(driver.Scheduler):
             msg = _("Is the appropriate service running?")
             raise exception.NoValidHost(reason=msg)
 
-        hosts = self._filter_hosts(request_spec, hosts, filter_properties)
+        hosts = self._filter_hosts(hosts, spec_obj)
         if not hosts:
             msg = _("Could not find another compute")
             raise exception.NoValidHost(reason=msg)
 
-        return random.choice(hosts)
+        # Note that we don't claim in the chance scheduler
+        num_instances = len(instance_uuids)
+        # If possible, we'd like to return distinct hosts for each instance.
+        # But when there are fewer available hosts than requested instances, we
+        # will need to return some duplicates.
+        if len(hosts) >= num_instances:
+            selected_hosts = random.sample(hosts, num_instances)
+        else:
+            selected_hosts = [random.choice(hosts)
+                    for i in range(num_instances)]
 
-    def select_hosts(self, context, request_spec, filter_properties):
-        """Selects a set of random hosts."""
-        hosts = [self._schedule(context, CONF.compute_topic,
-            request_spec, filter_properties)
-            for instance_uuid in request_spec.get('instance_uuids', [])]
-        if not hosts:
-            raise exception.NoValidHost(reason="")
-        return hosts
+        # This is the overall list of values to be returned. There will be one
+        # item per instance, and that item will be a list of Selection objects
+        # representing the selected host and zero or more alternates.
+        # NOTE(edleafe): in a multi-cell environment, this can return
+        # alternates from different cells. When support for multiple cells is
+        # implemented in select_destinations, this will have to be updated to
+        # restrict alternates to come from the same cell.
+        selections_to_return = []
 
-    def select_destinations(self, context, request_spec, filter_properties):
-        """Selects random destinations."""
-        num_instances = request_spec['num_instances']
-        # NOTE(alaski): Returns a list of HostState objects for compatibility
-        # with filter_scheduler
-        dests = []
-        for i in range(num_instances):
-            host = self._schedule(context, CONF.compute_topic,
-                    request_spec, filter_properties)
-            host_state = host_manager.HostState(host, None)
-            dests.append(host_state)
+        # We can't return dupes as alternates, since alternates are used when
+        # building to the selected host fails.
+        if return_alternates:
+            alts_per_instance = min(len(hosts), CONF.scheduler.max_attempts)
+        else:
+            alts_per_instance = 0
+        for sel_host in selected_hosts:
+            selection = objects.Selection.from_host_state(sel_host)
+            sel_plus_alts = [selection]
+            while len(sel_plus_alts) < alts_per_instance:
+                candidate = random.choice(hosts)
+                if (candidate not in sel_plus_alts) and (
+                        candidate not in selected_hosts):
+                    # We don't want to include a selected host as an alternate,
+                    # as it will have a high likelihood of not having enough
+                    # resources left after it has an instance built on it.
+                    alt_select = objects.Selection.from_host_state(candidate)
+                    sel_plus_alts.append(alt_select)
+            selections_to_return.append(sel_plus_alts)
+        return selections_to_return
 
-        if len(dests) < num_instances:
-            raise exception.NoValidHost(reason='')
-        return dests
-
-    def schedule_run_instance(self, context, request_spec,
-                              admin_password, injected_files,
-                              requested_networks, is_first_time,
-                              filter_properties):
-        """Create and run an instance or instances."""
-        instance_uuids = request_spec.get('instance_uuids')
-        for num, instance_uuid in enumerate(instance_uuids):
-            request_spec['instance_properties']['launch_index'] = num
-            try:
-                host = self._schedule(context, CONF.compute_topic,
-                                      request_spec, filter_properties)
-                updated_instance = driver.instance_update_db(context,
-                        instance_uuid)
-                self.compute_rpcapi.run_instance(context,
-                        instance=updated_instance, host=host,
-                        requested_networks=requested_networks,
-                        injected_files=injected_files,
-                        admin_password=admin_password,
-                        is_first_time=is_first_time,
-                        request_spec=request_spec,
-                        filter_properties=filter_properties)
-            except Exception as ex:
-                # NOTE(vish): we don't reraise the exception here to make sure
-                #             that all instances in the request get set to
-                #             error properly
-                driver.handle_schedule_error(context, ex, instance_uuid,
-                                             request_spec)
-
-    def schedule_prep_resize(self, context, image, request_spec,
-                             filter_properties, instance, instance_type,
-                             reservations):
-        """Select a target for resize."""
-        host = self._schedule(context, CONF.compute_topic, request_spec,
-                              filter_properties)
-        self.compute_rpcapi.prep_resize(context, image, instance,
-                instance_type, host, reservations)
+    def select_destinations(self, context, spec_obj, instance_uuids,
+            alloc_reqs_by_rp_uuid, provider_summaries,
+            allocation_request_version=None, return_alternates=False):
+        """Selects random destinations. Returns a list of list of Selection
+        objects.
+        """
+        num_instances = spec_obj.num_instances
+        # TODO(danms): This needs to be extended to support multiple cells
+        # and limiting the destination scope to a single requested cell
+        host_selections = self._schedule(context, compute_rpcapi.RPC_TOPIC,
+                spec_obj, instance_uuids)
+        if len(host_selections) < num_instances:
+            reason = _('There are not enough hosts available.')
+            raise exception.NoValidHost(reason=reason)
+        return host_selections

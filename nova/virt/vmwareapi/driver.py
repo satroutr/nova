@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2013 Hewlett-Packard Development Company, L.P.
 # Copyright (c) 2012 VMware, Inc.
 # Copyright (c) 2011 Citrix Systems, Inc.
@@ -18,182 +16,467 @@
 #    under the License.
 
 """
-A connection to the VMware ESX platform.
-
-**Related Flags**
-
-:vmwareapi_host_ip:         IP address or Name of VMware ESX/VC server.
-:vmwareapi_host_username:   Username for connection to VMware ESX/VC Server.
-:vmwareapi_host_password:   Password for connection to VMware ESX/VC Server.
-:vmwareapi_cluster_name:    Name of a VMware Cluster ComputeResource.
-:vmwareapi_task_poll_interval: The interval (seconds) used for polling of
-                            remote tasks
-                            (default: 5.0).
-:vmwareapi_api_retry_count: The API retry count in case of failure such as
-                            network failures (socket errors etc.)
-                            (default: 10).
-:vnc_port:                  VNC starting port (default: 5900)
-:vnc_port_total:            Total number of VNC ports (default: 10000)
-:vnc_password:              VNC password
-:use_linked_clone:          Whether to use linked clone (default: True)
+A connection to the VMware vCenter platform.
 """
 
-import time
+import os
+import re
 
-from eventlet import event
-from oslo.config import cfg
+from oslo_log import log as logging
+from oslo_utils import excutils
+from oslo_utils import units
+from oslo_utils import versionutils as v_utils
+from oslo_vmware import api
+from oslo_vmware import exceptions as vexc
+from oslo_vmware import pbm
+from oslo_vmware import vim
+from oslo_vmware import vim_util
 
+from nova.compute import power_state
+from nova.compute import task_states
+from nova.compute import utils as compute_utils
+import nova.conf
 from nova import exception
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import loopingcall
+from nova.i18n import _
+import nova.privsep.path
+from nova import rc_fields as fields
 from nova.virt import driver
+from nova.virt.vmwareapi import constants
+from nova.virt.vmwareapi import ds_util
 from nova.virt.vmwareapi import error_util
 from nova.virt.vmwareapi import host
-from nova.virt.vmwareapi import vim
-from nova.virt.vmwareapi import vim_util
+from nova.virt.vmwareapi import vim_util as nova_vim_util
 from nova.virt.vmwareapi import vm_util
 from nova.virt.vmwareapi import vmops
 from nova.virt.vmwareapi import volumeops
 
-
 LOG = logging.getLogger(__name__)
 
-vmwareapi_opts = [
-    cfg.StrOpt('vmwareapi_host_ip',
-               default=None,
-               help='URL for connection to VMware ESX/VC host. Required if '
-                    'compute_driver is vmwareapi.VMwareESXDriver or '
-                    'vmwareapi.VMwareVCDriver.'),
-    cfg.StrOpt('vmwareapi_host_username',
-               default=None,
-               help='Username for connection to VMware ESX/VC host. '
-                    'Used only if compute_driver is '
-                    'vmwareapi.VMwareESXDriver or vmwareapi.VMwareVCDriver.'),
-    cfg.StrOpt('vmwareapi_host_password',
-               default=None,
-               help='Password for connection to VMware ESX/VC host. '
-                    'Used only if compute_driver is '
-                    'vmwareapi.VMwareESXDriver or vmwareapi.VMwareVCDriver.',
-               secret=True),
-    cfg.StrOpt('vmwareapi_cluster_name',
-               default=None,
-               help='Name of a VMware Cluster ComputeResource. '
-                    'Used only if compute_driver is '
-                    'vmwareapi.VMwareVCDriver.'),
-    cfg.FloatOpt('vmwareapi_task_poll_interval',
-                 default=5.0,
-                 help='The interval used for polling of remote tasks. '
-                       'Used only if compute_driver is '
-                       'vmwareapi.VMwareESXDriver or '
-                       'vmwareapi.VMwareVCDriver.'),
-    cfg.IntOpt('vmwareapi_api_retry_count',
-               default=10,
-               help='The number of times we retry on failures, e.g., '
-                    'socket error, etc. '
-                    'Used only if compute_driver is '
-                    'vmwareapi.VMwareESXDriver or vmwareapi.VMwareVCDriver.'),
-    cfg.IntOpt('vnc_port',
-               default=5900,
-               help='VNC starting port'),
-    cfg.IntOpt('vnc_port_total',
-               default=10000,
-               help='Total number of VNC ports'),
-    cfg.StrOpt('vnc_password',
-               default=None,
-               help='VNC password',
-               secret=True),
-    cfg.BoolOpt('use_linked_clone',
-                default=True,
-                help='Whether to use linked clone'),
-    ]
+CONF = nova.conf.CONF
 
-CONF = cfg.CONF
-CONF.register_opts(vmwareapi_opts)
-
-TIME_BETWEEN_API_CALL_RETRIES = 2.0
+TIME_BETWEEN_API_CALL_RETRIES = 1.0
+MAX_CONSOLE_BYTES = 100 * units.Ki
 
 
-class Failure(Exception):
-    """Base Exception class for handling task failures."""
+class VMwareVCDriver(driver.ComputeDriver):
+    """The VC host connection object."""
 
-    def __init__(self, details):
-        self.details = details
+    capabilities = {
+        "has_imagecache": True,
+        "supports_recreate": False,
+        "supports_migrate_to_same_host": True,
+        "supports_attach_interface": True,
+        "supports_multiattach": False
+    }
 
-    def __str__(self):
-        return str(self.details)
+    # Legacy nodename is of the form: <mo id>(<cluster name>)
+    # e.g. domain-26(TestCluster)
+    # We assume <mo id> consists of alphanumeric, _ and -.
+    # We assume cluster name is everything between the first ( and the last ).
+    # We pull out <mo id> for re-use.
+    LEGACY_NODENAME = re.compile('([\w-]+)\(.+\)')
 
+    # The vCenter driver includes API that acts on ESX hosts or groups
+    # of ESX hosts in clusters or non-cluster logical-groupings.
+    #
+    # vCenter is not a hypervisor itself, it works with multiple
+    # hypervisor host machines and their guests. This fact can
+    # subtly alter how vSphere and OpenStack interoperate.
 
-class VMwareESXDriver(driver.ComputeDriver):
-    """The ESX host connection object."""
+    def __init__(self, virtapi, scheme="https"):
+        super(VMwareVCDriver, self).__init__(virtapi)
 
-    # VMwareAPI has both ESXi and vCenter API sets.
-    # The ESXi API are a proper sub-set of the vCenter API.
-    # That is to say, nearly all valid ESXi calls are
-    # valid vCenter calls. There are some small edge-case
-    # exceptions regarding VNC, CIM, User management & SSO.
+        if (CONF.vmware.host_ip is None or
+            CONF.vmware.host_username is None or
+            CONF.vmware.host_password is None):
+            raise Exception(_("Must specify host_ip, host_username and "
+                              "host_password to use vmwareapi.VMwareVCDriver"))
 
-    def __init__(self, virtapi, read_only=False, scheme="https"):
-        super(VMwareESXDriver, self).__init__(virtapi)
+        if CONF.vnc.keymap:
+            LOG.warning('The option "[vnc] keymap" has been deprecated in '
+                        'favor of the VMWare-specific "[vmware] vnc_keymap" '
+                        'option. Please update nova.conf to address this '
+                        'change')
 
-        self._host_ip = CONF.vmwareapi_host_ip
-        host_username = CONF.vmwareapi_host_username
-        host_password = CONF.vmwareapi_host_password
-        api_retry_count = CONF.vmwareapi_api_retry_count
-        if not self._host_ip or host_username is None or host_password is None:
-            raise Exception(_("Must specify vmwareapi_host_ip,"
-                              "vmwareapi_host_username "
-                              "and vmwareapi_host_password to use"
-                              "compute_driver=vmwareapi.VMwareESXDriver or "
-                              "vmwareapi.VMwareVCDriver"))
+        self._datastore_regex = None
+        if CONF.vmware.datastore_regex:
+            try:
+                self._datastore_regex = re.compile(CONF.vmware.datastore_regex)
+            except re.error:
+                raise exception.InvalidInput(reason=
+                    _("Invalid Regular Expression %s")
+                    % CONF.vmware.datastore_regex)
 
-        self._session = VMwareAPISession(self._host_ip,
-                                         host_username, host_password,
-                                         api_retry_count, scheme=scheme)
-        self._volumeops = volumeops.VMwareVolumeOps(self._session)
-        self._vmops = vmops.VMwareVMOps(self._session, self.virtapi,
-                                        self._volumeops)
-        self._host = host.Host(self._session)
-        self._host_state = None
+        self._session = VMwareAPISession(scheme=scheme)
+
+        self._check_min_version()
+
+        # Update the PBM location if necessary
+        if CONF.vmware.pbm_enabled:
+            self._update_pbm_location()
+
+        self._validate_configuration()
+        self._cluster_name = CONF.vmware.cluster_name
+        self._cluster_ref = vm_util.get_cluster_ref_by_name(self._session,
+                                                            self._cluster_name)
+        if self._cluster_ref is None:
+            raise exception.NotFound(_("The specified cluster '%s' was not "
+                                       "found in vCenter")
+                                     % self._cluster_name)
+        self._vcenter_uuid = self._get_vcenter_uuid()
+        self._nodename = self._create_nodename(self._cluster_ref.value)
+        self._volumeops = volumeops.VMwareVolumeOps(self._session,
+                                                    self._cluster_ref)
+        self._vmops = vmops.VMwareVMOps(self._session,
+                                        virtapi,
+                                        self._volumeops,
+                                        self._cluster_ref,
+                                        datastore_regex=self._datastore_regex)
+        self._vc_state = host.VCState(self._session,
+                                      self._nodename,
+                                      self._cluster_ref,
+                                      self._datastore_regex)
+
+        # Register the OpenStack extension
+        self._register_openstack_extension()
+
+    def _check_min_version(self):
+        min_version = v_utils.convert_version_to_int(constants.MIN_VC_VERSION)
+        next_min_ver = v_utils.convert_version_to_int(
+            constants.NEXT_MIN_VC_VERSION)
+        vc_version = vim_util.get_vc_version(self._session)
+        LOG.info("VMware vCenter version: %s", vc_version)
+        if v_utils.convert_version_to_int(vc_version) < min_version:
+            raise exception.NovaException(
+                _('Detected vCenter version %(version)s. Nova requires VMware '
+                  'vCenter version %(min_version)s or greater.') % {
+                      'version': vc_version,
+                      'min_version': constants.MIN_VC_VERSION})
+        elif v_utils.convert_version_to_int(vc_version) < next_min_ver:
+            LOG.warning('Running Nova with a VMware vCenter version less '
+                        'than %(version)s is deprecated. The required '
+                        'minimum version of vCenter will be raised to '
+                        '%(version)s in the 16.0.0 release.',
+                        {'version': constants.NEXT_MIN_VC_VERSION})
 
     @property
-    def host_state(self):
-        if not self._host_state:
-            self._host_state = host.HostState(self._session,
-                                              self._host_ip)
-        return self._host_state
-
-    def init_host(self, host):
-        """Do the initialization that needs to be done."""
-        # FIXME(sateesh): implement this
-        pass
-
-    def legacy_nwinfo(self):
+    def need_legacy_block_device_info(self):
         return False
 
-    def list_instances(self):
-        """List VM instances."""
+    def _update_pbm_location(self):
+        if CONF.vmware.pbm_wsdl_location:
+            pbm_wsdl_loc = CONF.vmware.pbm_wsdl_location
+        else:
+            version = vim_util.get_vc_version(self._session)
+            pbm_wsdl_loc = pbm.get_pbm_wsdl_location(version)
+        self._session.pbm_wsdl_loc_set(pbm_wsdl_loc)
+
+    def _validate_configuration(self):
+        if CONF.vmware.pbm_enabled:
+            if not CONF.vmware.pbm_default_policy:
+                raise error_util.PbmDefaultPolicyUnspecified()
+            if not pbm.get_profile_id_by_name(
+                            self._session,
+                            CONF.vmware.pbm_default_policy):
+                raise error_util.PbmDefaultPolicyDoesNotExist()
+            if CONF.vmware.datastore_regex:
+                LOG.warning("datastore_regex is ignored when PBM is enabled")
+                self._datastore_regex = None
+
+    def init_host(self, host):
+        vim = self._session.vim
+        if vim is None:
+            self._session._create_session()
+
+    def cleanup_host(self, host):
+        self._session.logout()
+
+    def _register_openstack_extension(self):
+        # Register an 'OpenStack' extension in vCenter
+        os_extension = self._session._call_method(vim_util, 'find_extension',
+                                                  constants.EXTENSION_KEY)
+        if os_extension is None:
+            try:
+                self._session._call_method(vim_util, 'register_extension',
+                                           constants.EXTENSION_KEY,
+                                           constants.EXTENSION_TYPE_INSTANCE)
+                LOG.info('Registered extension %s with vCenter',
+                         constants.EXTENSION_KEY)
+            except vexc.VimFaultException as e:
+                with excutils.save_and_reraise_exception() as ctx:
+                    if 'InvalidArgument' in e.fault_list:
+                        LOG.debug('Extension %s already exists.',
+                                  constants.EXTENSION_KEY)
+                        ctx.reraise = False
+        else:
+            LOG.debug('Extension %s already exists.', constants.EXTENSION_KEY)
+
+    def cleanup(self, context, instance, network_info, block_device_info=None,
+                destroy_disks=True, migrate_data=None, destroy_vifs=True):
+        """Cleanup after instance being destroyed by Hypervisor."""
+        pass
+
+    def resume_state_on_host_boot(self, context, instance, network_info,
+                                  block_device_info=None):
+        """resume guest state when a host is booted."""
+        # Check if the instance is running already and avoid doing
+        # anything if it is.
+        state = vm_util.get_vm_state(self._session, instance)
+        ignored_states = [power_state.RUNNING, power_state.SUSPENDED]
+        if state in ignored_states:
+            return
+        # Instance is not up and could be in an unknown state.
+        # Be as absolute as possible about getting it back into
+        # a known and running state.
+        self.reboot(context, instance, network_info, 'hard',
+                    block_device_info)
+
+    def list_instance_uuids(self):
+        """List VM instance UUIDs."""
         return self._vmops.list_instances()
 
-    def spawn(self, context, instance, image_meta, injected_files,
-              admin_password, network_info=None, block_device_info=None):
-        """Create VM instance."""
-        self._vmops.spawn(context, instance, image_meta, network_info,
-                          block_device_info)
+    def list_instances(self):
+        """List VM instances from the single compute node."""
+        return self._vmops.list_instances()
 
-    def snapshot(self, context, instance, name, update_task_state):
+    def migrate_disk_and_power_off(self, context, instance, dest,
+                                   flavor, network_info,
+                                   block_device_info=None,
+                                   timeout=0, retry_interval=0):
+        """Transfers the disk of a running instance in multiple phases, turning
+        off the instance before the end.
+        """
+        # TODO(PhilDay): Add support for timeout (clean shutdown)
+        return self._vmops.migrate_disk_and_power_off(context, instance,
+                                                      dest, flavor)
+
+    def confirm_migration(self, context, migration, instance, network_info):
+        """Confirms a resize, destroying the source VM."""
+        self._vmops.confirm_migration(migration, instance, network_info)
+
+    def finish_revert_migration(self, context, instance, network_info,
+                                block_device_info=None, power_on=True):
+        """Finish reverting a resize, powering back on the instance."""
+        self._vmops.finish_revert_migration(context, instance, network_info,
+                                            block_device_info, power_on)
+
+    def finish_migration(self, context, migration, instance, disk_info,
+                         network_info, image_meta, resize_instance,
+                         block_device_info=None, power_on=True):
+        """Completes a resize, turning on the migrated instance."""
+        self._vmops.finish_migration(context, migration, instance, disk_info,
+                                     network_info, image_meta, resize_instance,
+                                     block_device_info, power_on)
+
+    def get_instance_disk_info(self, instance, block_device_info=None):
+        pass
+
+    def get_vnc_console(self, context, instance):
+        """Return link to instance's VNC console using vCenter logic."""
+        # vCenter does not actually run the VNC service
+        # itself. You must talk to the VNC host underneath vCenter.
+        return self._vmops.get_vnc_console(instance)
+
+    def get_mks_console(self, context, instance):
+        return self._vmops.get_mks_console(instance)
+
+    def get_console_output(self, context, instance):
+        if not CONF.vmware.serial_log_dir:
+            LOG.error("The 'serial_log_dir' config option is not set!")
+            return
+        fname = instance.uuid.replace('-', '')
+        path = os.path.join(CONF.vmware.serial_log_dir, fname)
+        if not os.path.exists(path):
+            LOG.warning('The console log is missing. Check your VSPC '
+                        'configuration', instance=instance)
+            return b""
+        read_log_data, remaining = nova.privsep.path.last_bytes(
+            path, MAX_CONSOLE_BYTES)
+        return read_log_data
+
+    def _get_vcenter_uuid(self):
+        """Retrieves the vCenter UUID."""
+
+        about = self._session._call_method(nova_vim_util, 'get_about_info')
+        return about.instanceUuid
+
+    def _create_nodename(self, mo_id):
+        """Return a nodename which uniquely describes a cluster.
+
+        The name will be of the form:
+          <mo id>.<vcenter uuid>
+        e.g.
+          domain-26.9d51f082-58a4-4449-beed-6fd205a5726b
+        """
+
+        return '%s.%s' % (mo_id, self._vcenter_uuid)
+
+    def _get_available_resources(self, host_stats):
+        return {'vcpus': host_stats['vcpus'],
+               'memory_mb': host_stats['host_memory_total'],
+               'local_gb': host_stats['disk_total'],
+               'vcpus_used': 0,
+               'memory_mb_used': host_stats['host_memory_total'] -
+                                 host_stats['host_memory_free'],
+               'local_gb_used': host_stats['disk_used'],
+               'hypervisor_type': host_stats['hypervisor_type'],
+               'hypervisor_version': host_stats['hypervisor_version'],
+               'hypervisor_hostname': host_stats['hypervisor_hostname'],
+                # The VMWare driver manages multiple hosts, so there are
+                # likely many different CPU models in use. As such it is
+                # impossible to provide any meaningful info on the CPU
+                # model of the "host"
+               'cpu_info': None,
+               'supported_instances': host_stats['supported_instances'],
+               'numa_topology': None,
+               }
+
+    def get_available_resource(self, nodename):
+        """Retrieve resource info.
+
+        This method is called when nova-compute launches, and
+        as part of a periodic task.
+
+        :returns: dictionary describing resources
+
+        """
+        host_stats = self._vc_state.get_host_stats(refresh=True)
+        stats_dict = self._get_available_resources(host_stats)
+        return stats_dict
+
+    def get_available_nodes(self, refresh=False):
+        """Returns nodenames of all nodes managed by the compute service.
+
+        This driver supports only one compute node.
+        """
+        return [self._nodename]
+
+    def get_inventory(self, nodename):
+        """Return a dict, keyed by resource class, of inventory information for
+        the supplied node.
+        """
+        stats = vm_util.get_stats_from_cluster(self._session,
+                                               self._cluster_ref)
+        datastores = ds_util.get_available_datastores(self._session,
+                                                      self._cluster_ref,
+                                                      self._datastore_regex)
+        total_disk_capacity = sum([ds.capacity for ds in datastores])
+        max_free_space = max([ds.freespace for ds in datastores])
+        reserved_disk_gb = compute_utils.convert_mb_to_ceil_gb(
+            CONF.reserved_host_disk_mb)
+        result = {
+            fields.ResourceClass.VCPU: {
+                'total': stats['cpu']['vcpus'],
+                'reserved': CONF.reserved_host_cpus,
+                'min_unit': 1,
+                'max_unit': stats['cpu']['max_vcpus_per_host'],
+                'step_size': 1,
+            },
+            fields.ResourceClass.MEMORY_MB: {
+                'total': stats['mem']['total'],
+                'reserved': CONF.reserved_host_memory_mb,
+                'min_unit': 1,
+                'max_unit': stats['mem']['max_mem_mb_per_host'],
+                'step_size': 1,
+            },
+            fields.ResourceClass.DISK_GB: {
+                'total': total_disk_capacity // units.Gi,
+                'reserved': reserved_disk_gb,
+                'min_unit': 1,
+                'max_unit': max_free_space // units.Gi,
+                'step_size': 1,
+            },
+        }
+        return result
+
+    def spawn(self, context, instance, image_meta, injected_files,
+              admin_password, allocations, network_info=None,
+              block_device_info=None):
+        """Create VM instance."""
+        self._vmops.spawn(context, instance, image_meta, injected_files,
+                          admin_password, network_info, block_device_info)
+
+    def attach_volume(self, context, connection_info, instance, mountpoint,
+                      disk_bus=None, device_type=None, encryption=None):
+        """Attach volume storage to VM instance."""
+        return self._volumeops.attach_volume(connection_info, instance)
+
+    def detach_volume(self, context, connection_info, instance, mountpoint,
+                      encryption=None):
+        """Detach volume storage to VM instance."""
+        # NOTE(claudiub): if context parameter is to be used in the future,
+        # the _detach_instance_volumes method will have to be updated as well.
+        return self._volumeops.detach_volume(connection_info, instance)
+
+    def get_volume_connector(self, instance):
+        """Return volume connector information."""
+        return self._volumeops.get_volume_connector(instance)
+
+    def get_host_ip_addr(self):
+        """Returns the IP address of the vCenter host."""
+        return CONF.vmware.host_ip
+
+    def snapshot(self, context, instance, image_id, update_task_state):
         """Create snapshot from a running VM instance."""
-        self._vmops.snapshot(context, instance, name, update_task_state)
+        self._vmops.snapshot(context, instance, image_id, update_task_state)
 
     def reboot(self, context, instance, network_info, reboot_type,
                block_device_info=None, bad_volumes_callback=None):
         """Reboot VM instance."""
-        self._vmops.reboot(instance, network_info)
+        self._vmops.reboot(instance, network_info, reboot_type)
 
-    def destroy(self, instance, network_info, block_device_info=None,
+    def _detach_instance_volumes(self, instance, block_device_info):
+        # We need to detach attached volumes
+        block_device_mapping = driver.block_device_info_get_mapping(
+            block_device_info)
+        if block_device_mapping:
+            # Certain disk types, for example 'IDE' do not support hot
+            # plugging. Hence we need to power off the instance and update
+            # the instance state.
+            self._vmops.power_off(instance)
+            for disk in block_device_mapping:
+                connection_info = disk['connection_info']
+                try:
+                    # NOTE(claudiub): Passing None as the context, as it is
+                    # not currently used.
+                    self.detach_volume(None, connection_info, instance,
+                                       disk.get('device_name'))
+                except exception.DiskNotFound:
+                    LOG.warning('The volume %s does not exist!',
+                                disk.get('device_name'),
+                                instance=instance)
+                except Exception as e:
+                    with excutils.save_and_reraise_exception():
+                        LOG.error("Failed to detach %(device_name)s. "
+                                  "Exception: %(exc)s",
+                                  {'device_name': disk.get('device_name'),
+                                   'exc': e},
+                                  instance=instance)
+
+    def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True):
         """Destroy VM instance."""
-        self._vmops.destroy(instance, network_info, destroy_disks)
+
+        # Destroy gets triggered when Resource Claim in resource_tracker
+        # is not successful. When resource claim is not successful,
+        # node is not set in instance. Perform destroy only if node is set
+        if not instance.node:
+            return
+
+        # A resize uses the same instance on the VC. We do not delete that
+        # VM in the event of a revert
+        if instance.task_state == task_states.RESIZE_REVERTING:
+            return
+
+        # We need to detach attached volumes
+        if block_device_info is not None:
+            try:
+                self._detach_instance_volumes(instance, block_device_info)
+            except vexc.ManagedObjectNotFoundException:
+                LOG.warning('Instance does not exists. Proceeding to '
+                            'delete instance properties on datastore',
+                            instance=instance)
+        self._vmops.destroy(instance, destroy_disks)
 
     def pause(self, instance):
         """Pause VM instance."""
@@ -203,11 +486,11 @@ class VMwareESXDriver(driver.ComputeDriver):
         """Unpause paused VM instance."""
         self._vmops.unpause(instance)
 
-    def suspend(self, instance):
+    def suspend(self, context, instance):
         """Suspend the specified instance."""
         self._vmops.suspend(instance)
 
-    def resume(self, instance, network_info, block_device_info=None):
+    def resume(self, context, instance, network_info, block_device_info=None):
         """Resume the suspended VM instance."""
         self._vmops.resume(instance)
 
@@ -220,36 +503,14 @@ class VMwareESXDriver(driver.ComputeDriver):
         """Unrescue the specified instance."""
         self._vmops.unrescue(instance)
 
-    def power_off(self, instance):
+    def power_off(self, instance, timeout=0, retry_interval=0):
         """Power off the specified instance."""
-        self._vmops.power_off(instance)
+        self._vmops.power_off(instance, timeout, retry_interval)
 
     def power_on(self, context, instance, network_info,
                  block_device_info=None):
         """Power on the specified instance."""
-        self._vmops._power_on(instance)
-
-    def resume_state_on_host_boot(self, context, instance, network_info,
-                                  block_device_info=None):
-        """resume guest state when a host is booted."""
-        # Check if the instance is running already and avoid doing
-        # anything if it is.
-        instances = self.list_instances()
-        if instance['uuid'] not in instances:
-            LOG.warn(_('Instance cannot be found in host, or in an unknown'
-                'state.'), instance=instance)
-        else:
-            state = vm_util.get_vm_state_from_name(self._session,
-                instance['uuid'])
-            ignored_states = ['poweredon', 'suspended']
-
-            if state.lower() in ignored_states:
-                return
-        # Instance is not up and could be in an unknown state.
-        # Be as absolute as possible about getting it back into
-        # a known and running state.
-        self.reboot(context, instance, network_info, 'hard',
-            block_device_info)
+        self._vmops.power_on(instance)
 
     def poll_rebooting_instances(self, timeout, instances):
         """Poll for rebooting instances."""
@@ -261,369 +522,103 @@ class VMwareESXDriver(driver.ComputeDriver):
 
     def get_diagnostics(self, instance):
         """Return data about VM diagnostics."""
-        return self._vmops.get_info(instance)
+        return self._vmops.get_diagnostics(instance)
 
-    def get_console_output(self, instance):
-        """Return snapshot of console."""
-        return self._vmops.get_console_output(instance)
+    def get_instance_diagnostics(self, instance):
+        """Return data about VM diagnostics."""
+        return self._vmops.get_instance_diagnostics(instance)
 
-    def get_vnc_console(self, instance):
-        """Return link to instance's VNC console."""
-        return self._vmops.get_vnc_console(instance)
+    def host_power_action(self, action):
+        """Host operations not supported by VC driver.
 
-    def get_volume_connector(self, instance):
-        """Return volume connector information."""
-        return self._volumeops.get_volume_connector(instance)
-
-    def get_host_ip_addr(self):
-        """Retrieves the IP address of the ESX host."""
-        return self._host_ip
-
-    def attach_volume(self, connection_info, instance, mountpoint):
-        """Attach volume storage to VM instance."""
-        return self._volumeops.attach_volume(connection_info,
-                                             instance,
-                                             mountpoint)
-
-    def detach_volume(self, connection_info, instance, mountpoint):
-        """Detach volume storage to VM instance."""
-        return self._volumeops.detach_volume(connection_info,
-                                             instance,
-                                             mountpoint)
-
-    def get_console_pool_info(self, console_type):
-        """Get info about the host on which the VM resides."""
-        return {'address': CONF.vmwareapi_host_ip,
-                'username': CONF.vmwareapi_host_username,
-                'password': CONF.vmwareapi_host_password}
-
-    def get_available_resource(self, nodename):
-        """Retrieve resource info.
-
-        This method is called when nova-compute launches, and
-        as part of a periodic task.
-
-        :returns: dictionary describing resources
-
+        This needs to override the ESX driver implementation.
         """
-        host_stats = self.get_host_stats(refresh=True)
-
-        # Updating host information
-        dic = {'vcpus': host_stats["vcpus"],
-               'memory_mb': host_stats['host_memory_total'],
-               'local_gb': host_stats['disk_total'],
-               'vcpus_used': 0,
-               'memory_mb_used': host_stats['host_memory_total'] -
-                                 host_stats['host_memory_free'],
-               'local_gb_used': host_stats['disk_used'],
-               'hypervisor_type': host_stats['hypervisor_type'],
-               'hypervisor_version': host_stats['hypervisor_version'],
-               'hypervisor_hostname': host_stats['hypervisor_hostname'],
-               'cpu_info': jsonutils.dumps(host_stats['cpu_info'])}
-
-        return dic
-
-    def update_host_status(self):
-        """Update the status info of the host, and return those values
-           to the calling program.
-        """
-        return self.host_state.update_status()
-
-    def get_host_stats(self, refresh=False):
-        """Return the current state of the host.
-
-           If 'refresh' is True, run the update first.
-        """
-        return self.host_state.get_host_stats(refresh=refresh)
-
-    def host_power_action(self, host, action):
-        """Reboots, shuts down or powers up the host."""
-        return self._host.host_power_action(host, action)
+        raise NotImplementedError()
 
     def host_maintenance_mode(self, host, mode):
-        """Start/Stop host maintenance window. On start, it triggers
-           guest VMs evacuation.
+        """Host operations not supported by VC driver.
+
+        This needs to override the ESX driver implementation.
         """
-        return self._host.host_maintenance_mode(host, mode)
+        raise NotImplementedError()
 
-    def set_host_enabled(self, host, enabled):
-        """Sets the specified host's ability to accept new instances."""
-        return self._host.set_host_enabled(host, enabled)
+    def set_host_enabled(self, enabled):
+        """Host operations not supported by VC driver.
 
-    def inject_network_info(self, instance, network_info):
+        This needs to override the ESX driver implementation.
+        """
+        raise NotImplementedError()
+
+    def get_host_uptime(self):
+        """Host uptime operation not supported by VC driver."""
+
+        msg = _("Multiple hosts may be managed by the VMWare "
+                "vCenter driver; therefore we do not return "
+                "uptime for just one host.")
+        raise NotImplementedError(msg)
+
+    def inject_network_info(self, instance, nw_info):
         """inject network info for specified instance."""
-        self._vmops.inject_network_info(instance, network_info)
+        self._vmops.inject_network_info(instance, nw_info)
 
-    def plug_vifs(self, instance, network_info):
-        """Plug VIFs into networks."""
-        self._vmops.plug_vifs(instance, network_info)
+    def manage_image_cache(self, context, all_instances):
+        """Manage the local cache of images."""
+        self._vmops.manage_image_cache(context, all_instances)
 
-    def unplug_vifs(self, instance, network_info):
-        """Unplug VIFs from networks."""
-        self._vmops.unplug_vifs(instance, network_info)
+    def instance_exists(self, instance):
+        """Efficient override of base instance_exists method."""
+        return self._vmops.instance_exists(instance)
 
+    def attach_interface(self, context, instance, image_meta, vif):
+        """Attach an interface to the instance."""
+        self._vmops.attach_interface(context, instance, image_meta, vif)
 
-class VMwareVCDriver(VMwareESXDriver):
-    """The ESX host connection object."""
-
-    # The vCenter driver includes several additional VMware vSphere
-    # capabilities that include API that act on hosts or groups of
-    # hosts in clusters or non-cluster logical-groupings.
-    #
-    # vCenter is not a hypervisor itself, it works with multiple
-    # hypervisor host machines and their guests. This fact can
-    # subtly alter how vSphere and OpenStack interoperate.
-
-    def __init__(self, virtapi, read_only=False, scheme="https"):
-        super(VMwareVCDriver, self).__init__(virtapi)
-        self._cluster_name = CONF.vmwareapi_cluster_name
-        if not self._cluster_name:
-            self._cluster = None
-        else:
-            self._cluster = vm_util.get_cluster_ref_from_name(
-                            self._session, self._cluster_name)
-            if self._cluster is None:
-                raise exception.NotFound(_("VMware Cluster %s is not found")
-                                           % self._cluster_name)
-        self._volumeops = volumeops.VMwareVolumeOps(self._session,
-                                                    self._cluster)
-        self._vmops = vmops.VMwareVMOps(self._session, self.virtapi,
-                                        self._volumeops, self._cluster)
-        self._vc_state = None
-
-    @property
-    def host_state(self):
-        if not self._vc_state:
-            self._vc_state = host.VCState(self._session,
-                                          self._host_ip,
-                                          self._cluster)
-        return self._vc_state
-
-    def migrate_disk_and_power_off(self, context, instance, dest,
-                                   instance_type, network_info,
-                                   block_device_info=None):
-        """
-        Transfers the disk of a running instance in multiple phases, turning
-        off the instance before the end.
-        """
-        return self._vmops.migrate_disk_and_power_off(context, instance,
-                                                      dest, instance_type)
-
-    def confirm_migration(self, migration, instance, network_info):
-        """Confirms a resize, destroying the source VM."""
-        self._vmops.confirm_migration(migration, instance, network_info)
-
-    def finish_revert_migration(self, instance, network_info,
-                                block_device_info=None, power_on=True):
-        """Finish reverting a resize, powering back on the instance."""
-        self._vmops.finish_revert_migration(instance, network_info,
-                                            block_device_info, power_on)
-
-    def finish_migration(self, context, migration, instance, disk_info,
-                         network_info, image_meta, resize_instance=False,
-                         block_device_info=None, power_on=True):
-        """Completes a resize, turning on the migrated instance."""
-        self._vmops.finish_migration(context, migration, instance, disk_info,
-                                     network_info, image_meta, resize_instance,
-                                     block_device_info, power_on)
-
-    def live_migration(self, context, instance_ref, dest,
-                       post_method, recover_method, block_migration=False,
-                       migrate_data=None):
-        """Live migration of an instance to another host."""
-        self._vmops.live_migration(context, instance_ref, dest,
-                                   post_method, recover_method,
-                                   block_migration)
-
-    def get_vnc_console(self, instance):
-        """Return link to instance's VNC console using vCenter logic."""
-        # In this situation, ESXi and vCenter require different
-        # API logic to create a valid VNC console connection object.
-        # In specific, vCenter does not actually run the VNC service
-        # itself. You must talk to the VNC host underneath vCenter.
-        return self._vmops.get_vnc_console_vcenter(instance)
+    def detach_interface(self, context, instance, vif):
+        """Detach an interface from the instance."""
+        self._vmops.detach_interface(context, instance, vif)
 
 
-class VMwareAPISession(object):
-    """
-    Sets up a session with the ESX host and handles all
+class VMwareAPISession(api.VMwareAPISession):
+    """Sets up a session with the VC/ESX host and handles all
     the calls made to the host.
     """
-
-    def __init__(self, host_ip, host_username, host_password,
-                 api_retry_count, scheme="https"):
-        self._host_ip = host_ip
-        self._host_username = host_username
-        self._host_password = host_password
-        self.api_retry_count = api_retry_count
-        self._scheme = scheme
-        self._session_id = None
-        self.vim = None
-        self._create_session()
-
-    def _get_vim_object(self):
-        """Create the VIM Object instance."""
-        return vim.Vim(protocol=self._scheme, host=self._host_ip)
-
-    def _create_session(self):
-        """Creates a session with the ESX host."""
-        while True:
-            try:
-                # Login and setup the session with the ESX host for making
-                # API calls
-                self.vim = self._get_vim_object()
-                session = self.vim.Login(
-                               self.vim.get_service_content().sessionManager,
-                               userName=self._host_username,
-                               password=self._host_password)
-                # Terminate the earlier session, if possible ( For the sake of
-                # preserving sessions as there is a limit to the number of
-                # sessions we can have )
-                if self._session_id:
-                    try:
-                        self.vim.TerminateSession(
-                                self.vim.get_service_content().sessionManager,
-                                sessionId=[self._session_id])
-                    except Exception as excep:
-                        # This exception is something we can live with. It is
-                        # just an extra caution on our side. The session may
-                        # have been cleared. We could have made a call to
-                        # SessionIsActive, but that is an overhead because we
-                        # anyway would have to call TerminateSession.
-                        LOG.debug(excep)
-                self._session_id = session.key
-                return
-            except Exception as excep:
-                LOG.critical(_("In vmwareapi:_create_session, "
-                              "got this exception: %s") % excep)
-                raise exception.NovaException(excep)
-
-    def __del__(self):
-        """Logs-out the session."""
-        # Logout to avoid un-necessary increase in session count at the
-        # ESX host
-        try:
-            self.vim.Logout(self.vim.get_service_content().sessionManager)
-        except Exception as excep:
-            # It is just cautionary on our part to do a logout in del just
-            # to ensure that the session is not left active.
-            LOG.debug(excep)
+    def __init__(self, host_ip=CONF.vmware.host_ip,
+                 host_port=CONF.vmware.host_port,
+                 username=CONF.vmware.host_username,
+                 password=CONF.vmware.host_password,
+                 retry_count=CONF.vmware.api_retry_count,
+                 scheme="https",
+                 cacert=CONF.vmware.ca_file,
+                 insecure=CONF.vmware.insecure,
+                 pool_size=CONF.vmware.connection_pool_size):
+        super(VMwareAPISession, self).__init__(
+                host=host_ip,
+                port=host_port,
+                server_username=username,
+                server_password=password,
+                api_retry_count=retry_count,
+                task_poll_interval=CONF.vmware.task_poll_interval,
+                scheme=scheme,
+                create_session=True,
+                cacert=cacert,
+                insecure=insecure,
+                pool_size=pool_size)
 
     def _is_vim_object(self, module):
         """Check if the module is a VIM Object instance."""
         return isinstance(module, vim.Vim)
 
     def _call_method(self, module, method, *args, **kwargs):
-        """
-        Calls a method within the module specified with
+        """Calls a method within the module specified with
         args provided.
         """
-        args = list(args)
-        retry_count = 0
-        exc = None
-        last_fault_list = []
-        while True:
-            try:
-                if not self._is_vim_object(module):
-                    # If it is not the first try, then get the latest
-                    # vim object
-                    if retry_count > 0:
-                        args = args[1:]
-                    args = [self.vim] + args
-                retry_count += 1
-                temp_module = module
+        if not self._is_vim_object(module):
+            return self.invoke_api(module, method, self.vim, *args, **kwargs)
+        else:
+            return self.invoke_api(module, method, *args, **kwargs)
 
-                for method_elem in method.split("."):
-                    temp_module = getattr(temp_module, method_elem)
-
-                return temp_module(*args, **kwargs)
-            except error_util.VimFaultException as excep:
-                # If it is a Session Fault Exception, it may point
-                # to a session gone bad. So we try re-creating a session
-                # and then proceeding ahead with the call.
-                exc = excep
-                if error_util.FAULT_NOT_AUTHENTICATED in excep.fault_list:
-                    # Because of the idle session returning an empty
-                    # RetrievePropertiesResponse and also the same is returned
-                    # when there is say empty answer to the query for
-                    # VMs on the host ( as in no VMs on the host), we have no
-                    # way to differentiate.
-                    # So if the previous response was also am empty response
-                    # and after creating a new session, we get the same empty
-                    # response, then we are sure of the response being supposed
-                    # to be empty.
-                    if error_util.FAULT_NOT_AUTHENTICATED in last_fault_list:
-                        return []
-                    last_fault_list = excep.fault_list
-                    self._create_session()
-                else:
-                    # No re-trying for errors for API call has gone through
-                    # and is the caller's fault. Caller should handle these
-                    # errors. e.g, InvalidArgument fault.
-                    break
-            except error_util.SessionOverLoadException as excep:
-                # For exceptions which may come because of session overload,
-                # we retry
-                exc = excep
-            except Exception as excep:
-                # If it is a proper exception, say not having furnished
-                # proper data in the SOAP call or the retry limit having
-                # exceeded, we raise the exception
-                exc = excep
-                break
-            # If retry count has been reached then break and
-            # raise the exception
-            if retry_count > self.api_retry_count:
-                break
-            time.sleep(TIME_BETWEEN_API_CALL_RETRIES)
-
-        LOG.critical(_("In vmwareapi:_call_method, "
-                     "got this exception: %s") % exc)
-        raise
-
-    def _get_vim(self):
-        """Gets the VIM object reference."""
-        if self.vim is None:
-            self._create_session()
-        return self.vim
-
-    def _wait_for_task(self, instance_uuid, task_ref):
-        """
-        Return a Deferred that will give the result of the given task.
+    def _wait_for_task(self, task_ref):
+        """Return a Deferred that will give the result of the given task.
         The task is polled until it completes.
         """
-        done = event.Event()
-        loop = loopingcall.FixedIntervalLoopingCall(self._poll_task,
-                                                    instance_uuid,
-                                                    task_ref, done)
-        loop.start(CONF.vmwareapi_task_poll_interval)
-        ret_val = done.wait()
-        loop.stop()
-        return ret_val
-
-    def _poll_task(self, instance_uuid, task_ref, done):
-        """
-        Poll the given task, and fires the given Deferred if we
-        get a result.
-        """
-        try:
-            task_info = self._call_method(vim_util, "get_dynamic_property",
-                            task_ref, "Task", "info")
-            task_name = task_info.name
-            if task_info.state in ['queued', 'running']:
-                return
-            elif task_info.state == 'success':
-                LOG.debug(_("Task [%(task_name)s] %(task_ref)s "
-                            "status: success"),
-                          {'task_name': task_name, 'task_ref': task_ref})
-                done.send("success")
-            else:
-                error_info = str(task_info.error.localizedMessage)
-                LOG.warn(_("Task [%(task_name)s] %(task_ref)s "
-                          "status: error %(error_info)s"),
-                         {'task_name': task_name, 'task_ref': task_ref,
-                          'error_info': error_info})
-                done.send_exception(exception.NovaException(error_info))
-        except Exception as excep:
-            LOG.warn(_("In vmwareapi:_poll_task, Got this error %s") % excep)
-            done.send_exception(excep)
+        return self.wait_for_task(task_ref)

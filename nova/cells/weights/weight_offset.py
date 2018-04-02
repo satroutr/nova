@@ -19,14 +19,20 @@ weight_offsets in the DB will be preferred.
 """
 
 from nova.cells import weights
+import nova.conf
+
+
+CONF = nova.conf.CONF
 
 
 class WeightOffsetWeigher(weights.BaseCellWeigher):
-    """
-    Weight cell by weight_offset db field.
+    """Weight cell by weight_offset db field.
     Originally designed so you can set a default cell by putting
     its weight_offset to 999999999999999 (highest weight wins)
     """
+
+    def weight_multiplier(self):
+        return CONF.cells.offset_weight_multiplier
 
     def _weigh_object(self, cell, weight_properties):
         """Returns whatever was in the DB for weight_offset."""

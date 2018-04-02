@@ -13,13 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from oslo_log import log as logging
 
-from nova.openstack.common import log as logging
+from nova.i18n import _LW
 from nova.scheduler import filters
 from nova import servicegroup
-
-CONF = cfg.CONF
 
 LOG = logging.getLogger(__name__)
 
@@ -27,21 +25,25 @@ LOG = logging.getLogger(__name__)
 class ComputeFilter(filters.BaseHostFilter):
     """Filter on active Compute nodes."""
 
+    RUN_ON_REBUILD = False
+
     def __init__(self):
         self.servicegroup_api = servicegroup.API()
 
-    def host_passes(self, host_state, filter_properties):
-        """Returns True for only active compute nodes."""
-        capabilities = host_state.capabilities
-        service = host_state.service
+    # Host state does not change within a request
+    run_filter_once_per_request = True
 
-        alive = self.servicegroup_api.service_is_up(service)
-        if not alive or service['disabled']:
-            LOG.debug(_("%(host_state)s is disabled or has not been "
-                    "heard from in a while"), {'host_state': host_state})
+    def host_passes(self, host_state, spec_obj):
+        """Returns True for only active compute nodes."""
+        service = host_state.service
+        if service['disabled']:
+            LOG.debug("%(host_state)s is disabled, reason: %(reason)s",
+                      {'host_state': host_state,
+                       'reason': service.get('disabled_reason')})
             return False
-        if not capabilities.get("enabled", True):
-            LOG.debug(_("%(host_state)s is disabled via capabilities"),
-                    {'host_state': host_state})
-            return False
+        else:
+            if not self.servicegroup_api.service_is_up(service):
+                LOG.warning(_LW("%(host_state)s has not been heard from in a "
+                                "while"), {'host_state': host_state})
+                return False
         return True

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -25,87 +23,103 @@ necessary.
 
 """
 
+from nova.objects import fields
+
 # possible task states during create()
-SCHEDULING = 'scheduling'
-BLOCK_DEVICE_MAPPING = 'block_device_mapping'
-NETWORKING = 'networking'
-SPAWNING = 'spawning'
+SCHEDULING = fields.InstanceTaskState.SCHEDULING
+BLOCK_DEVICE_MAPPING = fields.InstanceTaskState.BLOCK_DEVICE_MAPPING
+NETWORKING = fields.InstanceTaskState.NETWORKING
+SPAWNING = fields.InstanceTaskState.SPAWNING
 
 # possible task states during snapshot()
-IMAGE_SNAPSHOT = 'image_snapshot'
-IMAGE_PENDING_UPLOAD = 'image_pending_upload'
-IMAGE_UPLOADING = 'image_uploading'
+IMAGE_SNAPSHOT = fields.InstanceTaskState.IMAGE_SNAPSHOT
+IMAGE_SNAPSHOT_PENDING = fields.InstanceTaskState.IMAGE_SNAPSHOT_PENDING
+IMAGE_PENDING_UPLOAD = fields.InstanceTaskState.IMAGE_PENDING_UPLOAD
+IMAGE_UPLOADING = fields.InstanceTaskState.IMAGE_UPLOADING
 
 # possible task states during backup()
-IMAGE_BACKUP = 'image_backup'
-
-# possible task states during live_snapshot()
-IMAGE_LIVE_SNAPSHOT = 'image_live_snapshot'
+IMAGE_BACKUP = fields.InstanceTaskState.IMAGE_BACKUP
 
 # possible task states during set_admin_password()
-UPDATING_PASSWORD = 'updating_password'
+UPDATING_PASSWORD = fields.InstanceTaskState.UPDATING_PASSWORD
 
 # possible task states during resize()
-RESIZE_PREP = 'resize_prep'
-RESIZE_MIGRATING = 'resize_migrating'
-RESIZE_MIGRATED = 'resize_migrated'
-RESIZE_FINISH = 'resize_finish'
+RESIZE_PREP = fields.InstanceTaskState.RESIZE_PREP
+RESIZE_MIGRATING = fields.InstanceTaskState.RESIZE_MIGRATING
+RESIZE_MIGRATED = fields.InstanceTaskState.RESIZE_MIGRATED
+RESIZE_FINISH = fields.InstanceTaskState.RESIZE_FINISH
 
 # possible task states during revert_resize()
-RESIZE_REVERTING = 'resize_reverting'
+RESIZE_REVERTING = fields.InstanceTaskState.RESIZE_REVERTING
 
 # possible task states during confirm_resize()
-RESIZE_CONFIRMING = 'resize_confirming'
+RESIZE_CONFIRMING = fields.InstanceTaskState.RESIZE_CONFIRMING
 
 # possible task states during reboot()
-REBOOTING = 'rebooting'
-REBOOTING_HARD = 'rebooting_hard'
+REBOOTING = fields.InstanceTaskState.REBOOTING
+REBOOT_PENDING = fields.InstanceTaskState.REBOOT_PENDING
+REBOOT_STARTED = fields.InstanceTaskState.REBOOT_STARTED
+REBOOTING_HARD = fields.InstanceTaskState.REBOOTING_HARD
+REBOOT_PENDING_HARD = fields.InstanceTaskState.REBOOT_PENDING_HARD
+REBOOT_STARTED_HARD = fields.InstanceTaskState.REBOOT_STARTED_HARD
 
 # possible task states during pause()
-PAUSING = 'pausing'
+PAUSING = fields.InstanceTaskState.PAUSING
 
 # possible task states during unpause()
-UNPAUSING = 'unpausing'
+UNPAUSING = fields.InstanceTaskState.UNPAUSING
 
 # possible task states during suspend()
-SUSPENDING = 'suspending'
+SUSPENDING = fields.InstanceTaskState.SUSPENDING
 
 # possible task states during resume()
-RESUMING = 'resuming'
-
-# NOTE(johannes): STOPPING and STARTING need to stick around for the
-# grizzly release for compatibility, but can be removed afterwards.
-# possible task states during stop()
-STOPPING = 'stopping'
-
-# possible task states during start()
-STARTING = 'starting'
+RESUMING = fields.InstanceTaskState.RESUMING
 
 # possible task states during power_off()
-POWERING_OFF = 'powering-off'
+POWERING_OFF = fields.InstanceTaskState.POWERING_OFF
 
 # possible task states during power_on()
-POWERING_ON = 'powering-on'
+POWERING_ON = fields.InstanceTaskState.POWERING_ON
 
 # possible task states during rescue()
-RESCUING = 'rescuing'
+RESCUING = fields.InstanceTaskState.RESCUING
 
 # possible task states during unrescue()
-UNRESCUING = 'unrescuing'
+UNRESCUING = fields.InstanceTaskState.UNRESCUING
 
 # possible task states during rebuild()
-REBUILDING = 'rebuilding'
-REBUILD_BLOCK_DEVICE_MAPPING = "rebuild_block_device_mapping"
-REBUILD_SPAWNING = 'rebuild_spawning'
+REBUILDING = fields.InstanceTaskState.REBUILDING
+REBUILD_BLOCK_DEVICE_MAPPING = \
+    fields.InstanceTaskState.REBUILD_BLOCK_DEVICE_MAPPING
+REBUILD_SPAWNING = fields.InstanceTaskState.REBUILD_SPAWNING
 
 # possible task states during live_migrate()
-MIGRATING = "migrating"
+MIGRATING = fields.InstanceTaskState.MIGRATING
 
 # possible task states during delete()
-DELETING = 'deleting'
+DELETING = fields.InstanceTaskState.DELETING
 
 # possible task states during soft_delete()
-SOFT_DELETING = 'soft-deleting'
+SOFT_DELETING = fields.InstanceTaskState.SOFT_DELETING
 
 # possible task states during restore()
-RESTORING = 'restoring'
+RESTORING = fields.InstanceTaskState.RESTORING
+
+# possible task states during shelve()
+SHELVING = fields.InstanceTaskState.SHELVING
+SHELVING_IMAGE_PENDING_UPLOAD = \
+    fields.InstanceTaskState.SHELVING_IMAGE_PENDING_UPLOAD
+SHELVING_IMAGE_UPLOADING = fields.InstanceTaskState.SHELVING_IMAGE_UPLOADING
+
+# possible task states during shelve_offload()
+SHELVING_OFFLOADING = fields.InstanceTaskState.SHELVING_OFFLOADING
+
+# possible task states during unshelve()
+UNSHELVING = fields.InstanceTaskState.UNSHELVING
+
+ALLOW_REBOOT = [None, REBOOTING, REBOOT_PENDING, REBOOT_STARTED, RESUMING,
+                REBOOTING_HARD, UNPAUSING, PAUSING, SUSPENDING]
+
+# These states indicate a reboot
+soft_reboot_states = (REBOOTING, REBOOT_PENDING, REBOOT_STARTED)
+hard_reboot_states = (REBOOTING_HARD, REBOOT_PENDING_HARD, REBOOT_STARTED_HARD)

@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -18,38 +16,34 @@
 
 """Instance Metadata information."""
 
-import base64
-import json
 import os
 import posixpath
 
-from oslo.config import cfg
+from oslo_log import log as logging
+from oslo_serialization import base64
+from oslo_serialization import jsonutils
+from oslo_utils import timeutils
+import six
 
 from nova.api.ec2 import ec2utils
 from nova.api.metadata import password
+from nova.api.metadata import vendordata_dynamic
+from nova.api.metadata import vendordata_json
 from nova import block_device
-from nova.compute import flavors
-from nova import conductor
+from nova.cells import opts as cells_opts
+from nova.cells import rpcapi as cells_rpcapi
+import nova.conf
 from nova import context
+from nova import exception
 from nova import network
+from nova.network.security_group import openstack_driver
+from nova import objects
+from nova.objects import virt_device_metadata as metadata_obj
 from nova import utils
-
-from nova.openstack.common import timeutils
 from nova.virt import netutils
 
 
-metadata_opts = [
-    cfg.StrOpt('config_drive_skip_versions',
-               default=('1.0 2007-01-19 2007-03-01 2007-08-29 2007-10-10 '
-                        '2007-12-15 2008-02-01 2008-09-01'),
-               help=('List of metadata versions to skip placing into the '
-                     'config drive')),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(metadata_opts)
-CONF.import_opt('dhcp_domain', 'nova.network.manager')
-
+CONF = nova.conf.CONF
 
 VERSIONS = [
     '1.0',
@@ -63,17 +57,43 @@ VERSIONS = [
     '2009-04-04',
 ]
 
+# NOTE(mikal): think of these strings as version numbers. They traditionally
+# correlate with OpenStack release dates, with all the changes for a given
+# release bundled into a single version. Note that versions in the future are
+# hidden from the listing, but can still be requested explicitly, which is
+# required for testing purposes. We know this isn't great, but its inherited
+# from EC2, which this needs to be compatible with.
 FOLSOM = '2012-08-10'
 GRIZZLY = '2013-04-04'
+HAVANA = '2013-10-17'
+LIBERTY = '2015-10-15'
+NEWTON_ONE = '2016-06-30'
+NEWTON_TWO = '2016-10-06'
+OCATA = '2017-02-22'
+
 OPENSTACK_VERSIONS = [
     FOLSOM,
     GRIZZLY,
+    HAVANA,
+    LIBERTY,
+    NEWTON_ONE,
+    NEWTON_TWO,
+    OCATA,
 ]
 
+VERSION = "version"
+CONTENT = "content"
 CONTENT_DIR = "content"
 MD_JSON_NAME = "meta_data.json"
+VD_JSON_NAME = "vendor_data.json"
+VD2_JSON_NAME = "vendor_data2.json"
+NW_JSON_NAME = "network_data.json"
 UD_NAME = "user_data"
 PASS_NAME = "password"
+MIME_TYPE_TEXT_PLAIN = "text/plain"
+MIME_TYPE_APPLICATION_JSON = "application/json"
+
+LOG = logging.getLogger(__name__)
 
 
 class InvalidMetadataVersion(Exception):
@@ -84,11 +104,12 @@ class InvalidMetadataPath(Exception):
     pass
 
 
-class InstanceMetadata():
+class InstanceMetadata(object):
     """Instance metadata."""
 
     def __init__(self, instance, address=None, content=None, extra_md=None,
-                 conductor_api=None, network_info=None):
+                 network_info=None, network_metadata=None,
+                 request_context=None):
         """Creation of this object should basically cover all time consuming
         collection.  Methods after that should not cause time delays due to
         network operations or lengthy cpu operations.
@@ -99,32 +120,35 @@ class InstanceMetadata():
         if not content:
             content = []
 
+        ctxt = context.get_admin_context()
+
+        # NOTE(danms): Sanitize the instance to limit the amount of stuff
+        # inside that may not pickle well (i.e. context). We also touch
+        # some of the things we'll lazy load later to make sure we keep their
+        # values in what we cache.
+        instance.ec2_ids
+        instance.keypairs
+        instance.device_metadata
+        instance = objects.Instance.obj_from_primitive(
+            instance.obj_to_primitive())
+
+        # The default value of mimeType is set to MIME_TYPE_TEXT_PLAIN
+        self.set_mimetype(MIME_TYPE_TEXT_PLAIN)
         self.instance = instance
         self.extra_md = extra_md
 
-        if conductor_api:
-            capi = conductor_api
-        else:
-            capi = conductor.API()
+        self.availability_zone = instance.get('availability_zone')
 
-        ctxt = context.get_admin_context()
+        secgroup_api = openstack_driver.get_openstack_security_group_driver()
+        self.security_groups = secgroup_api.get_instance_security_groups(
+            ctxt, instance)
 
-        self.availability_zone = ec2utils.get_availability_zone_by_host(
-                instance['host'], capi)
+        self.mappings = _format_instance_mapping(ctxt, instance)
 
-        self.ip_info = ec2utils.get_ip_info_for_instance(ctxt, instance)
-
-        self.security_groups = capi.security_group_get_by_instance(ctxt,
-                                                              instance)
-
-        self.mappings = _format_instance_mapping(capi, ctxt, instance)
-
-        if instance.get('user_data', None) is not None:
-            self.userdata_raw = base64.b64decode(instance['user_data'])
+        if instance.user_data is not None:
+            self.userdata_raw = base64.decode_as_bytes(instance.user_data)
         else:
             self.userdata_raw = None
-
-        self.ec2_ids = capi.get_ec2_ids(ctxt, instance)
 
         self.address = address
 
@@ -133,15 +157,23 @@ class InstanceMetadata():
 
         self.password = password.extract_password(instance)
 
-        self.uuid = instance.get('uuid')
+        self.uuid = instance.uuid
 
         self.content = {}
         self.files = []
 
         # get network info, and the rendered network template
         if network_info is None:
-            network_info = network.API().get_instance_nw_info(ctxt, instance,
-                                                          conductor_api=capi)
+            network_info = instance.info_cache.network_info
+
+        # expose network metadata
+        if network_metadata is None:
+            self.network_metadata = netutils.get_network_metadata(network_info)
+        else:
+            self.network_metadata = network_metadata
+
+        self.ip_info = \
+                ec2utils.get_ip_info_for_instance_from_nw_info(network_info)
 
         self.network_config = None
         cfg = netutils.get_injected_network_template(network_info)
@@ -153,7 +185,7 @@ class InstanceMetadata():
                 'content_path': "/%s/%s" % (CONTENT_DIR, key)}
 
         # 'content' is passed in from the configdrive code in
-        # nova/virt/libvirt/driver.py.  Thats how we get the injected files
+        # nova/virt/libvirt/driver.py.  That's how we get the injected files
         # (personalities) in. AFAIK they're not stored in the db at all,
         # so are not available later (web service metadata time).
         for (path, contents) in content:
@@ -161,6 +193,43 @@ class InstanceMetadata():
             self.files.append({'path': path,
                 'content_path': "/%s/%s" % (CONTENT_DIR, key)})
             self.content[key] = contents
+
+        self.route_configuration = None
+
+        # NOTE(mikal): the decision to not pass extra_md here like we
+        # do to the StaticJSON driver is deliberate. extra_md will
+        # contain the admin password for the instance, and we shouldn't
+        # pass that to external services.
+        self.vendordata_providers = {
+            'StaticJSON': vendordata_json.JsonFileVendorData(
+                instance=instance, address=address,
+                extra_md=extra_md, network_info=network_info),
+            'DynamicJSON': vendordata_dynamic.DynamicVendorData(
+                instance=instance, address=address,
+                network_info=network_info, context=request_context)
+        }
+
+    def _route_configuration(self):
+        if self.route_configuration:
+            return self.route_configuration
+
+        path_handlers = {UD_NAME: self._user_data,
+                         PASS_NAME: self._password,
+                         VD_JSON_NAME: self._vendor_data,
+                         VD2_JSON_NAME: self._vendor_data2,
+                         MD_JSON_NAME: self._metadata_as_json,
+                         NW_JSON_NAME: self._network_data,
+                         VERSION: self._handle_version,
+                         CONTENT: self._handle_content}
+
+        self.route_configuration = RouteConfiguration(path_handlers)
+        return self.route_configuration
+
+    def set_mimetype(self, mime_type):
+        self.md_mimetype = mime_type
+
+    def get_mimetype(self):
+        return self.md_mimetype
 
     def get_ec2_metadata(self, version):
         if version == "latest":
@@ -174,16 +243,19 @@ class InstanceMetadata():
         floating_ips = self.ip_info['floating_ips']
         floating_ip = floating_ips and floating_ips[0] or ''
 
+        fixed_ips = self.ip_info['fixed_ips']
+        fixed_ip = fixed_ips and fixed_ips[0] or ''
+
         fmt_sgroups = [x['name'] for x in self.security_groups]
 
         meta_data = {
-            'ami-id': self.ec2_ids['ami-id'],
-            'ami-launch-index': self.instance['launch_index'],
+            'ami-id': self.instance.ec2_ids.ami_id,
+            'ami-launch-index': self.instance.launch_index,
             'ami-manifest-path': 'FIXME',
-            'instance-id': self.ec2_ids['instance-id'],
+            'instance-id': self.instance.ec2_ids.instance_id,
             'hostname': hostname,
-            'local-ipv4': self.address,
-            'reservation-id': self.instance['reservation_id'],
+            'local-ipv4': fixed_ip or self.address,
+            'reservation-id': self.instance.reservation_id,
             'security-groups': fmt_sgroups}
 
         # public keys are strangely rendered in ec2 metadata service
@@ -195,10 +267,10 @@ class InstanceMetadata():
         # meta-data/public-keys/ : '0=%s' % keyname
         # meta-data/public-keys/0/ : 'openssh-key'
         # meta-data/public-keys/0/openssh-key : '%s' % publickey
-        if self.instance['key_name']:
+        if self.instance.key_name:
             meta_data['public-keys'] = {
-                '0': {'_name': "0=" + self.instance['key_name'],
-                      'openssh-key': self.instance['key_data']}}
+                '0': {'_name': "0=" + self.instance.key_name,
+                      'openssh-key': self.instance.key_data}}
 
         if self._check_version('2007-01-19', version):
             meta_data['local-hostname'] = hostname
@@ -210,7 +282,7 @@ class InstanceMetadata():
             meta_data['product-codes'] = []
 
         if self._check_version('2007-08-29', version):
-            instance_type = flavors.extract_flavor(self.instance)
+            instance_type = self.instance.get_flavor()
             meta_data['instance-type'] = instance_type['name']
 
         if False and self._check_version('2007-10-10', version):
@@ -219,10 +291,10 @@ class InstanceMetadata():
 
         if self._check_version('2007-12-15', version):
             meta_data['block-device-mapping'] = self.mappings
-            if 'kernel-id' in self.ec2_ids:
-                meta_data['kernel-id'] = self.ec2_ids['kernel-id']
-            if 'ramdisk-id' in self.ec2_ids:
-                meta_data['ramdisk-id'] = self.ec2_ids['ramdisk-id']
+            if self.instance.ec2_ids.kernel_id:
+                meta_data['kernel-id'] = self.instance.ec2_ids.kernel_id
+            if self.instance.ec2_ids.ramdisk_id:
+                meta_data['ramdisk-id'] = self.instance.ec2_ids.ramdisk_id
 
         if self._check_version('2008-02-01', version):
             meta_data['placement'] = {'availability-zone':
@@ -244,79 +316,212 @@ class InstanceMetadata():
 
     def get_openstack_item(self, path_tokens):
         if path_tokens[0] == CONTENT_DIR:
-            if len(path_tokens) == 1:
-                raise KeyError("no listing for %s" % "/".join(path_tokens))
-            if len(path_tokens) != 2:
-                raise KeyError("Too many tokens for /%s" % CONTENT_DIR)
-            return self.content[path_tokens[1]]
+            return self._handle_content(path_tokens)
+        return self._route_configuration().handle_path(path_tokens)
 
-        version = path_tokens[0]
-        if version == "latest":
-            version = OPENSTACK_VERSIONS[-1]
-
-        if version not in OPENSTACK_VERSIONS:
-            raise InvalidMetadataVersion(version)
-
-        path = '/'.join(path_tokens[1:])
-
-        if len(path_tokens) == 1:
-            # request for /version, give a list of what is available
-            ret = [MD_JSON_NAME]
-            if self.userdata_raw is not None:
-                ret.append(UD_NAME)
-            if self._check_os_version(GRIZZLY, version):
-                ret.append(PASS_NAME)
-            return ret
-
-        if path == UD_NAME:
-            if self.userdata_raw is None:
-                raise KeyError(path)
-            return self.userdata_raw
-
-        if path == PASS_NAME and self._check_os_version(GRIZZLY, version):
-            return password.handle_password
-
-        if path != MD_JSON_NAME:
-            raise KeyError(path)
-
-        # right now, the only valid path is metadata.json
-        metadata = {}
-        metadata['uuid'] = self.uuid
-
+    def _metadata_as_json(self, version, path):
+        metadata = {'uuid': self.uuid}
         if self.launch_metadata:
             metadata['meta'] = self.launch_metadata
-
         if self.files:
             metadata['files'] = self.files
-
         if self.extra_md:
             metadata.update(self.extra_md)
-
-        if self.launch_metadata:
-            metadata['meta'] = self.launch_metadata
-
         if self.network_config:
             metadata['network_config'] = self.network_config
 
-        if self.instance['key_name']:
-            metadata['public_keys'] = {
-                self.instance['key_name']: self.instance['key_data']
-            }
+        if self.instance.key_name:
+            if cells_opts.get_cell_type() == 'compute':
+                cells_api = cells_rpcapi.CellsAPI()
+                try:
+                    keypair = cells_api.get_keypair_at_top(
+                      context.get_admin_context(), self.instance.user_id,
+                      self.instance.key_name)
+                except exception.KeypairNotFound:
+                    # NOTE(lpigueir): If keypair was deleted, treat
+                    # it like it never had any
+                    keypair = None
+            else:
+                keypairs = self.instance.keypairs
+                # NOTE(mriedem): It's possible for the keypair to be deleted
+                # before it was migrated to the instance_extra table, in which
+                # case lazy-loading instance.keypairs will handle the 404 and
+                # just set an empty KeyPairList object on the instance.
+                keypair = keypairs[0] if keypairs else None
+
+            if keypair:
+                metadata['public_keys'] = {
+                    keypair.name: keypair.public_key,
+                }
+
+                metadata['keys'] = [
+                    {'name': keypair.name,
+                     'type': keypair.type,
+                     'data': keypair.public_key}
+                ]
+            else:
+                LOG.debug("Unable to find keypair for instance with "
+                          "key name '%s'.", self.instance.key_name,
+                          instance=self.instance)
 
         metadata['hostname'] = self._get_hostname()
-
-        metadata['name'] = self.instance['display_name']
-        metadata['launch_index'] = self.instance['launch_index']
+        metadata['name'] = self.instance.display_name
+        metadata['launch_index'] = self.instance.launch_index
         metadata['availability_zone'] = self.availability_zone
 
         if self._check_os_version(GRIZZLY, version):
-            metadata['random_seed'] = base64.b64encode(os.urandom(512))
+            metadata['random_seed'] = base64.encode_as_text(os.urandom(512))
 
-        data = {
-            MD_JSON_NAME: json.dumps(metadata),
-        }
+        if self._check_os_version(LIBERTY, version):
+            metadata['project_id'] = self.instance.project_id
 
-        return data[path]
+        if self._check_os_version(NEWTON_ONE, version):
+            metadata['devices'] = self._get_device_metadata(version)
+
+        self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
+        return jsonutils.dump_as_bytes(metadata)
+
+    def _get_device_metadata(self, version):
+        """Build a device metadata dict based on the metadata objects. This is
+        done here in the metadata API as opposed to in the objects themselves
+        because the metadata dict is part of the guest API and thus must be
+        controlled.
+        """
+        device_metadata_list = []
+        vif_vlans_supported = self._check_os_version(OCATA, version)
+        if self.instance.device_metadata is not None:
+            for device in self.instance.device_metadata.devices:
+                device_metadata = {}
+                bus = 'none'
+                address = 'none'
+
+                if 'bus' in device:
+                    # TODO(artom/mriedem) It would be nice if we had something
+                    # more generic, like a type identifier or something, built
+                    # into these types of objects, like a get_meta_type()
+                    # abstract method on the base DeviceBus class.
+                    if isinstance(device.bus, metadata_obj.PCIDeviceBus):
+                        bus = 'pci'
+                    elif isinstance(device.bus, metadata_obj.USBDeviceBus):
+                        bus = 'usb'
+                    elif isinstance(device.bus, metadata_obj.SCSIDeviceBus):
+                        bus = 'scsi'
+                    elif isinstance(device.bus, metadata_obj.IDEDeviceBus):
+                        bus = 'ide'
+                    elif isinstance(device.bus, metadata_obj.XenDeviceBus):
+                        bus = 'xen'
+                    else:
+                        LOG.debug('Metadata for device with unknown bus %s '
+                                  'has not been included in the '
+                                  'output', device.bus.__class__.__name__)
+                        continue
+                    if 'address' in device.bus:
+                        address = device.bus.address
+
+                if isinstance(device, metadata_obj.NetworkInterfaceMetadata):
+                    vlan = None
+                    if vif_vlans_supported and 'vlan' in device:
+                        vlan = device.vlan
+
+                    # Skip devices without tags on versions that
+                    # don't support vlans
+                    if not (vlan or 'tags' in device):
+                        continue
+
+                    device_metadata['type'] = 'nic'
+                    device_metadata['mac'] = device.mac
+                    if vlan:
+                        device_metadata['vlan'] = vlan
+                elif isinstance(device, metadata_obj.DiskMetadata):
+                    device_metadata['type'] = 'disk'
+                    # serial and path are optional parameters
+                    if 'serial' in device:
+                        device_metadata['serial'] = device.serial
+                    if 'path' in device:
+                        device_metadata['path'] = device.path
+                else:
+                    LOG.debug('Metadata for device of unknown type %s has not '
+                              'been included in the '
+                              'output', device.__class__.__name__)
+                    continue
+
+                device_metadata['bus'] = bus
+                device_metadata['address'] = address
+                if 'tags' in device:
+                    device_metadata['tags'] = device.tags
+
+                device_metadata_list.append(device_metadata)
+        return device_metadata_list
+
+    def _handle_content(self, path_tokens):
+        if len(path_tokens) == 1:
+            raise KeyError("no listing for %s" % "/".join(path_tokens))
+        if len(path_tokens) != 2:
+            raise KeyError("Too many tokens for /%s" % CONTENT_DIR)
+        return self.content[path_tokens[1]]
+
+    def _handle_version(self, version, path):
+        # request for /version, give a list of what is available
+        ret = [MD_JSON_NAME]
+        if self.userdata_raw is not None:
+            ret.append(UD_NAME)
+        if self._check_os_version(GRIZZLY, version):
+            ret.append(PASS_NAME)
+        if self._check_os_version(HAVANA, version):
+            ret.append(VD_JSON_NAME)
+        if self._check_os_version(LIBERTY, version):
+            ret.append(NW_JSON_NAME)
+        if self._check_os_version(NEWTON_TWO, version):
+            ret.append(VD2_JSON_NAME)
+
+        return ret
+
+    def _user_data(self, version, path):
+        if self.userdata_raw is None:
+            raise KeyError(path)
+        return self.userdata_raw
+
+    def _network_data(self, version, path):
+        if self.network_metadata is None:
+            return jsonutils.dump_as_bytes({})
+        return jsonutils.dump_as_bytes(self.network_metadata)
+
+    def _password(self, version, path):
+        if self._check_os_version(GRIZZLY, version):
+            return password.handle_password
+        raise KeyError(path)
+
+    def _vendor_data(self, version, path):
+        if self._check_os_version(HAVANA, version):
+            self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
+
+            if (CONF.api.vendordata_providers and
+                'StaticJSON' in CONF.api.vendordata_providers):
+                return jsonutils.dump_as_bytes(
+                    self.vendordata_providers['StaticJSON'].get())
+
+        raise KeyError(path)
+
+    def _vendor_data2(self, version, path):
+        if self._check_os_version(NEWTON_TWO, version):
+            self.set_mimetype(MIME_TYPE_APPLICATION_JSON)
+
+            j = {}
+            for provider in CONF.api.vendordata_providers:
+                if provider == 'StaticJSON':
+                    j['static'] = self.vendordata_providers['StaticJSON'].get()
+                else:
+                    values = self.vendordata_providers[provider].get()
+                    for key in list(values):
+                        if key in j:
+                            LOG.warning('Removing duplicate metadata key: %s',
+                                        key, instance=self.instance)
+                            del values[key]
+                    j.update(values)
+
+            return jsonutils.dump_as_bytes(j)
+
+        raise KeyError(path)
 
     def _check_version(self, required, requested, versions=VERSIONS):
         return versions.index(requested) >= versions.index(required)
@@ -325,7 +530,7 @@ class InstanceMetadata():
         return self._check_version(required, requested, OPENSTACK_VERSIONS)
 
     def _get_hostname(self):
-        return "%s%s%s" % (self.instance['hostname'],
+        return "%s%s%s" % (self.instance.hostname,
                            '.' if CONF.dhcp_domain else '',
                            CONF.dhcp_domain)
 
@@ -334,6 +539,9 @@ class InstanceMetadata():
             path = posixpath.normpath("/" + path)
         else:
             path = posixpath.normpath(path)
+
+        # Set default mimeType. It will be modified only if there is a change
+        self.set_mimetype(MIME_TYPE_TEXT_PLAIN)
 
         # fix up requests, prepending /ec2 to anything that does not match
         path_tokens = path.split('/')[1:]
@@ -353,6 +561,10 @@ class InstanceMetadata():
                 # NOTE(vish): don't show versions that are in the future
                 today = timeutils.utcnow().strftime("%Y-%m-%d")
                 versions = [v for v in OPENSTACK_VERSIONS if v <= today]
+                if OPENSTACK_VERSIONS != versions:
+                    LOG.debug("future versions %s hidden in version list",
+                              [v for v in OPENSTACK_VERSIONS
+                               if v not in versions], instance=self.instance)
                 versions += ["latest"]
             else:
                 versions = VERSIONS + ["latest"]
@@ -372,7 +584,7 @@ class InstanceMetadata():
         """Yields (path, value) tuples for metadata elements."""
         # EC2 style metadata
         for version in VERSIONS + ["latest"]:
-            if version in CONF.config_drive_skip_versions.split(' '):
+            if version in CONF.api.config_drive_skip_versions.split(' '):
                 continue
 
             data = self.get_ec2_metadata(version)
@@ -387,9 +599,10 @@ class InstanceMetadata():
                 pass
 
             filepath = os.path.join('ec2', version, 'meta-data.json')
-            yield (filepath, json.dumps(data['meta-data']))
+            yield (filepath, jsonutils.dump_as_bytes(data['meta-data']))
 
-        for version in OPENSTACK_VERSIONS + ["latest"]:
+        ALL_OPENSTACK_VERSIONS = OPENSTACK_VERSIONS + ["latest"]
+        for version in ALL_OPENSTACK_VERSIONS:
             path = 'openstack/%s/%s' % (version, MD_JSON_NAME)
             yield (path, self.lookup(path))
 
@@ -397,30 +610,88 @@ class InstanceMetadata():
             if self.userdata_raw is not None:
                 yield (path, self.lookup(path))
 
-        for (cid, content) in self.content.iteritems():
+            if self._check_version(HAVANA, version, ALL_OPENSTACK_VERSIONS):
+                path = 'openstack/%s/%s' % (version, VD_JSON_NAME)
+                yield (path, self.lookup(path))
+
+            if self._check_version(LIBERTY, version, ALL_OPENSTACK_VERSIONS):
+                path = 'openstack/%s/%s' % (version, NW_JSON_NAME)
+                yield (path, self.lookup(path))
+
+            if self._check_version(NEWTON_TWO, version,
+                                   ALL_OPENSTACK_VERSIONS):
+                path = 'openstack/%s/%s' % (version, VD2_JSON_NAME)
+                yield (path, self.lookup(path))
+
+        for (cid, content) in self.content.items():
             yield ('%s/%s/%s' % ("openstack", CONTENT_DIR, cid), content)
 
 
-def get_metadata_by_address(conductor_api, address):
+class RouteConfiguration(object):
+    """Routes metadata paths to request handlers."""
+
+    def __init__(self, path_handler):
+        self.path_handlers = path_handler
+
+    def _version(self, version):
+        if version == "latest":
+            version = OPENSTACK_VERSIONS[-1]
+
+        if version not in OPENSTACK_VERSIONS:
+            raise InvalidMetadataVersion(version)
+
+        return version
+
+    def handle_path(self, path_tokens):
+        version = self._version(path_tokens[0])
+        if len(path_tokens) == 1:
+            path = VERSION
+        else:
+            path = '/'.join(path_tokens[1:])
+
+        path_handler = self.path_handlers[path]
+
+        if path_handler is None:
+            raise KeyError(path)
+
+        return path_handler(version, path)
+
+
+def get_metadata_by_address(address):
     ctxt = context.get_admin_context()
     fixed_ip = network.API().get_fixed_ip_by_address(ctxt, address)
+    LOG.info('Fixed IP %(ip)s translates to instance UUID %(uuid)s',
+             {'ip': address, 'uuid': fixed_ip['instance_uuid']})
 
-    return get_metadata_by_instance_id(conductor_api,
-                                       fixed_ip['instance_uuid'],
+    return get_metadata_by_instance_id(fixed_ip['instance_uuid'],
                                        address,
                                        ctxt)
 
 
-def get_metadata_by_instance_id(conductor_api, instance_id, address,
-                                ctxt=None):
+def get_metadata_by_instance_id(instance_id, address, ctxt=None):
     ctxt = ctxt or context.get_admin_context()
-    instance = conductor_api.instance_get_by_uuid(ctxt, instance_id)
-    return InstanceMetadata(instance, address)
+    attrs = ['ec2_ids', 'flavor', 'info_cache',
+             'metadata', 'system_metadata',
+             'security_groups', 'keypairs',
+             'device_metadata']
+    try:
+        im = objects.InstanceMapping.get_by_instance_uuid(ctxt, instance_id)
+    except exception.InstanceMappingNotFound:
+        LOG.warning('Instance mapping for %(uuid)s not found; '
+                    'cell setup is incomplete', {'uuid': instance_id})
+        instance = objects.Instance.get_by_uuid(ctxt, instance_id,
+                                                expected_attrs=attrs)
+        return InstanceMetadata(instance, address)
+
+    with context.target_cell(ctxt, im.cell_mapping) as cctxt:
+        instance = objects.Instance.get_by_uuid(cctxt, instance_id,
+                                                expected_attrs=attrs)
+        return InstanceMetadata(instance, address)
 
 
-def _format_instance_mapping(conductor_api, ctxt, instance):
-    bdms = conductor_api.block_device_mapping_get_all_by_instance(
-               ctxt, instance)
+def _format_instance_mapping(ctxt, instance):
+    bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+            ctxt, instance.uuid)
     return block_device.instance_block_mapping(instance, bdms)
 
 
@@ -442,6 +713,8 @@ def ec2_md_print(data):
         return output[:-1]
     elif isinstance(data, list):
         return '\n'.join(data)
+    elif isinstance(data, (bytes, six.text_type)):
+        return data
     else:
         return str(data)
 

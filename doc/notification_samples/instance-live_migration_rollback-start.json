@@ -1,0 +1,6 @@
+{
+    "event_type":"instance.live_migration_rollback.start",
+    "payload":{"$ref":"common_payloads/InstanceActionPayload.json#"},
+    "priority":"INFO",
+    "publisher_id":"nova-compute:compute"
+}

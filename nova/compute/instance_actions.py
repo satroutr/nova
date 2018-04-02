@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2013 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -23,6 +21,10 @@ tend to maintain the casing sent to the API.
 
 Maintaining a list of actions here should protect against inconsistencies when
 they are used.
+
+The naming style of instance actions should be snake_case, as it will
+consistent with the API names. Do not modify the old ones because they have
+been exposed to users.
 """
 
 CREATE = 'create'
@@ -36,6 +38,7 @@ REBUILD = 'rebuild'
 REVERT_RESIZE = 'revertResize'
 CONFIRM_RESIZE = 'confirmResize'
 RESIZE = 'resize'
+MIGRATE = 'migrate'
 PAUSE = 'pause'
 UNPAUSE = 'unpause'
 SUSPEND = 'suspend'
@@ -43,3 +46,27 @@ RESUME = 'resume'
 RESCUE = 'rescue'
 UNRESCUE = 'unrescue'
 CHANGE_PASSWORD = 'changePassword'
+SHELVE = 'shelve'
+SHELVE_OFFLOAD = 'shelveOffload'
+UNSHELVE = 'unshelve'
+LIVE_MIGRATION = 'live-migration'
+LIVE_MIGRATION_CANCEL = 'live_migration_cancel'
+LIVE_MIGRATION_FORCE_COMPLETE = 'live_migration_force_complete'
+TRIGGER_CRASH_DUMP = 'trigger_crash_dump'
+# The extend_volume action is not like the traditional instance actions which
+# are driven directly through the compute API. The extend_volume action is
+# initiated by a Cinder volume extend (resize) action. Cinder will call the
+# server external events API after the volume extend is performed so that Nova
+# can perform any updates on the compute side. The instance actions framework
+# is used for tracking this asynchronous operation so the user/admin can know
+# when it is done in case they need/want to reboot the guest operating system.
+EXTEND_VOLUME = 'extend_volume'
+ATTACH_INTERFACE = 'attach_interface'
+DETACH_INTERFACE = 'detach_interface'
+ATTACH_VOLUME = 'attach_volume'
+DETACH_VOLUME = 'detach_volume'
+SWAP_VOLUME = 'swap_volume'
+LOCK = 'lock'
+UNLOCK = 'unlock'
+BACKUP = 'createBackup'
+CREATE_IMAGE = 'createImage'

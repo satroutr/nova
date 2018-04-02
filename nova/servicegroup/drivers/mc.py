@@ -17,89 +17,92 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from oslo.config import cfg
+import iso8601
+from oslo_log import log as logging
+from oslo_utils import timeutils
 
-from nova import conductor
-from nova import context
-from nova.openstack.common import log as logging
-from nova.openstack.common import memorycache
-from nova.openstack.common import timeutils
+from nova import cache_utils
+import nova.conf
+from nova.i18n import _, _LI, _LW
 from nova.servicegroup import api
+from nova.servicegroup.drivers import base
 
 
-CONF = cfg.CONF
-CONF.import_opt('service_down_time', 'nova.service')
-CONF.import_opt('memcached_servers', 'nova.openstack.common.memorycache')
+CONF = nova.conf.CONF
 
 
 LOG = logging.getLogger(__name__)
 
 
-class MemcachedDriver(api.ServiceGroupDriver):
+class MemcachedDriver(base.Driver):
 
     def __init__(self, *args, **kwargs):
-        test = kwargs.get('test')
-        if not CONF.memcached_servers and not test:
-            raise RuntimeError(_('memcached_servers not defined'))
-        self.mc = memorycache.get_client()
-        self.db_allowed = kwargs.get('db_allowed', True)
-        self.conductor_api = conductor.API(use_local=self.db_allowed)
+        self.mc = cache_utils.get_memcached_client(
+                expiration_time=CONF.service_down_time)
 
     def join(self, member_id, group_id, service=None):
         """Join the given service with its group."""
 
-        msg = _('Memcached_Driver: join new ServiceGroup member '
-                '%(member_id)s to the %(group_id)s group, '
-                'service = %(service)s')
-        LOG.debug(msg, locals())
+        LOG.debug('Memcached_Driver: join new ServiceGroup member '
+                  '%(member_id)s to the %(group_id)s group, '
+                  'service = %(service)s',
+                  {'member_id': member_id,
+                   'group_id': group_id,
+                   'service': service})
         if service is None:
             raise RuntimeError(_('service is a mandatory argument for '
                                  'Memcached based ServiceGroup driver'))
         report_interval = service.report_interval
         if report_interval:
             service.tg.add_timer(report_interval, self._report_state,
-                                 report_interval, service)
+                                 api.INITIAL_REPORTING_DELAY, service)
 
     def is_up(self, service_ref):
         """Moved from nova.utils
         Check whether a service is up based on last heartbeat.
         """
         key = "%(topic)s:%(host)s" % service_ref
-        return self.mc.get(str(key)) is not None
+        is_up = self.mc.get(str(key)) is not None
+        if not is_up:
+            LOG.debug('Seems service %s is down', key)
 
-    def get_all(self, group_id):
-        """
-        Returns ALL members of the given group
-        """
-        LOG.debug(_('Memcached_Driver: get_all members of the %s group') %
-                  group_id)
-        rs = []
-        ctxt = context.get_admin_context()
-        services = self.conductor_api.service_get_all_by_topic(ctxt, group_id)
-        for service in services:
-            if self.is_up(service):
-                rs.append(service['host'])
-        return rs
+        return is_up
+
+    def updated_time(self, service_ref):
+        """Get the updated time from memcache"""
+        key = "%(topic)s:%(host)s" % service_ref
+        updated_time_in_mc = self.mc.get(str(key))
+        updated_time_in_db = service_ref['updated_at']
+
+        if updated_time_in_mc:
+            # Change mc time to offset-aware time
+            updated_time_in_mc = \
+                updated_time_in_mc.replace(tzinfo=iso8601.UTC)
+            if updated_time_in_db <= updated_time_in_mc:
+                return updated_time_in_mc
+
+        return updated_time_in_db
 
     def _report_state(self, service):
         """Update the state of this service in the datastore."""
-        ctxt = context.get_admin_context()
         try:
             key = "%(topic)s:%(host)s" % service.service_ref
             # memcached has data expiration time capability.
             # set(..., time=CONF.service_down_time) uses it and
             # reduces key-deleting code.
             self.mc.set(str(key),
-                        timeutils.utcnow(),
-                        time=CONF.service_down_time)
+                        timeutils.utcnow())
 
             # TODO(termie): make this pattern be more elegant.
             if getattr(service, 'model_disconnected', False):
                 service.model_disconnected = False
-                LOG.error(_('Recovered model server connection!'))
+                LOG.info(
+                    _LI('Recovered connection to memcache server '
+                        'for reporting service status.'))
 
         # TODO(vish): this should probably only catch connection errors
-        except Exception:  # pylint: disable=W0702
+        except Exception:
             if not getattr(service, 'model_disconnected', False):
                 service.model_disconnected = True
-                LOG.exception(_('model server went away'))
+                LOG.warning(_LW('Lost connection to memcache server '
+                             'for reporting service status.'))

@@ -13,25 +13,28 @@
 #    under the License.
 
 import os
-import shutil
-import tempfile
 
-from oslo.config import cfg
+from oslo_config import cfg
+from oslo_log import log as logging
+import six
 
 from nova import exception
+from nova.i18n import _
 from nova.network import dns_driver
-from nova.openstack.common import log as logging
+
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 
 class MiniDNS(dns_driver.DNSDriver):
-    """
-    Trivial DNS driver. This will read/write to a local, flat file
-    and have no effect on your actual DNS system. This class is
-    strictly for testing purposes, and should keep you out of dependency
-    hell.
+    """Trivial DNS driver. This will read/write to either a local,
+    flat file or an in memory StringIO and have no effect on your actual
+    DNS system. This class is strictly for testing purposes, and should
+    keep you out of dependency hell.
+
+    A file is used when CONF.log_dir is set. This is relevant for when
+    two different DNS driver instances share the same data file.
 
     Note that there is almost certainly a race condition here that
     will manifest anytime instances are rapidly created and deleted.
@@ -39,27 +42,23 @@ class MiniDNS(dns_driver.DNSDriver):
     """
 
     def __init__(self):
+        filename = None
         if CONF.log_dir:
-            self.filename = os.path.join(CONF.log_dir, "dnstest.txt")
-            self.tempdir = None
+            filename = os.path.join(CONF.log_dir, "dnstest.txt")
+            self.file = open(filename, 'w+')
         else:
-            self.tempdir = tempfile.mkdtemp()
-            self.filename = os.path.join(self.tempdir, "dnstest.txt")
-        LOG.debug(_('minidns file is |%s|'), self.filename)
-
-        if not os.path.exists(self.filename):
-            f = open(self.filename, "w+")
-            f.write("#  minidns\n\n\n")
-            f.close()
+            self.file = six.StringIO()
+        if not filename or not os.path.exists(filename):
+            self.file.write("#  minidns\n\n\n")
+            self.file.flush()
 
     def get_domains(self):
         entries = []
-        infile = open(self.filename, 'r')
-        for line in infile:
+        self.file.seek(0)
+        for line in self.file:
             entry = self.parse_line(line)
             if entry and entry['address'] == 'domain':
                 entries.append(entry['name'])
-        infile.close()
         return entries
 
     def qualify(self, name, domain):
@@ -81,10 +80,10 @@ class MiniDNS(dns_driver.DNSDriver):
         if self.get_entries_by_name(name, domain):
             raise exception.FloatingIpDNSExists(name=name, domain=domain)
 
-        outfile = open(self.filename, 'a+')
-        outfile.write("%s   %s   %s\n" %
-            (address, self.qualify(name, domain), type))
-        outfile.close()
+        self.file.seek(0, os.SEEK_END)
+        self.file.write("%s   %s   %s\n" %
+                        (address, self.qualify(name, domain), type))
+        self.file.flush()
 
     def parse_line(self, line):
         vals = line.split()
@@ -106,21 +105,21 @@ class MiniDNS(dns_driver.DNSDriver):
             raise exception.InvalidInput(_("Invalid name"))
 
         deleted = False
-        infile = open(self.filename, 'r')
-        outfile = tempfile.NamedTemporaryFile('w', delete=False)
-        for line in infile:
+        keeps = []
+        self.file.seek(0)
+        for line in self.file:
             entry = self.parse_line(line)
-            if ((not entry) or
+            if (not entry or
                     entry['name'] != self.qualify(name, domain)):
-                outfile.write(line)
+                keeps.append(line)
             else:
                 deleted = True
-        infile.close()
-        outfile.close()
-        shutil.move(outfile.name, self.filename)
+        self.file.truncate(0)
+        self.file.seek(0)
+        self.file.write(''.join(keeps))
+        self.file.flush()
         if not deleted:
-            LOG.warn(_('Cannot delete entry |%s|'),
-                self.qualify(name, domain))
+            LOG.warning('Cannot delete entry |%s|', self.qualify(name, domain))
             raise exception.NotFound
 
     def modify_address(self, name, address, domain):
@@ -128,24 +127,25 @@ class MiniDNS(dns_driver.DNSDriver):
         if not self.get_entries_by_name(name, domain):
             raise exception.NotFound
 
-        infile = open(self.filename, 'r')
-        outfile = tempfile.NamedTemporaryFile('w', delete=False)
-        for line in infile:
+        lines = []
+        self.file.seek(0)
+        for line in self.file:
             entry = self.parse_line(line)
             if (entry and
                     entry['name'] == self.qualify(name, domain)):
-                outfile.write("%s   %s   %s\n" %
+                lines.append("%s   %s   %s\n" %
                     (address, self.qualify(name, domain), entry['type']))
             else:
-                outfile.write(line)
-        infile.close()
-        outfile.close()
-        shutil.move(outfile.name, self.filename)
+                lines.append(line)
+        self.file.truncate(0)
+        self.file.seek(0)
+        self.file.write(''.join(lines))
+        self.file.flush()
 
     def get_entries_by_address(self, address, domain):
         entries = []
-        infile = open(self.filename, 'r')
-        for line in infile:
+        self.file.seek(0)
+        for line in self.file:
             entry = self.parse_line(line)
             if entry and entry['address'] == address.lower():
                 if entry['name'].endswith(domain.lower()):
@@ -153,56 +153,54 @@ class MiniDNS(dns_driver.DNSDriver):
                     if name not in entries:
                         entries.append(name)
 
-        infile.close()
         return entries
 
     def get_entries_by_name(self, name, domain):
         entries = []
-        infile = open(self.filename, 'r')
-        for line in infile:
+        self.file.seek(0)
+        for line in self.file:
             entry = self.parse_line(line)
             if (entry and
                     entry['name'] == self.qualify(name, domain)):
                 entries.append(entry['address'])
-        infile.close()
         return entries
 
     def delete_dns_file(self):
-        if os.path.exists(self.filename):
-            try:
-                os.remove(self.filename)
-            except OSError:
-                pass
-        if self.tempdir and os.path.exists(self.tempdir):
-            try:
-                shutil.rmtree(self.tempdir)
-            except OSError:
-                pass
+        self.file.close()
+        try:
+            if os.path.exists(self.file.name):
+                try:
+                    os.remove(self.file.name)
+                except OSError:
+                    pass
+        except AttributeError:
+            # This was a BytesIO, which has no name.
+            pass
 
     def create_domain(self, fqdomain):
         if self.get_entries_by_name(fqdomain, ''):
             raise exception.FloatingIpDNSExists(name=fqdomain, domain='')
 
-        outfile = open(self.filename, 'a+')
-        outfile.write("%s   %s   %s\n" %
-            ('domain', fqdomain, 'domain'))
-        outfile.close()
+        self.file.seek(0, os.SEEK_END)
+        self.file.write("%s   %s   %s\n" % ('domain', fqdomain, 'domain'))
+        self.file.flush()
 
     def delete_domain(self, fqdomain):
         deleted = False
-        infile = open(self.filename, 'r')
-        outfile = tempfile.NamedTemporaryFile('w', delete=False)
-        for line in infile:
+        keeps = []
+        self.file.seek(0)
+        for line in self.file:
             entry = self.parse_line(line)
-            if ((not entry) or
+            if (not entry or
                     entry['domain'] != fqdomain.lower()):
-                outfile.write(line)
+                keeps.append(line)
             else:
-                LOG.info(_("deleted %s"), entry)
+                LOG.info("deleted %s", entry)
                 deleted = True
-        infile.close()
-        outfile.close()
-        shutil.move(outfile.name, self.filename)
+        self.file.truncate(0)
+        self.file.seek(0)
+        self.file.write(''.join(keeps))
+        self.file.flush()
         if not deleted:
-            LOG.warn(_('Cannot delete domain |%s|'), fqdomain)
+            LOG.warning('Cannot delete domain |%s|', fqdomain)
             raise exception.NotFound

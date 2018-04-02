@@ -1,5 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
+# Copyright 2013 IBM Corp.
 # Copyright 2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,50 +14,30 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import inspect
-import math
-import time
-from xml.dom import minidom
+import functools
 
-from lxml import etree
+import microversion_parse
+from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import encodeutils
+from oslo_utils import strutils
+import six
 import webob
 
-from nova.api.openstack import xmlutil
+from nova.api.openstack import api_version_request as api_version
+from nova.api.openstack import versioned_method
+from nova.api import wsgi
 from nova import exception
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova import wsgi
+from nova import i18n
+from nova.i18n import _
 
-
-XMLNS_V10 = 'http://docs.rackspacecloud.com/servers/api/v1.0'
-XMLNS_V11 = 'http://docs.openstack.org/compute/api/v1.1'
-
-XMLNS_ATOM = 'http://www.w3.org/2005/Atom'
 
 LOG = logging.getLogger(__name__)
 
-# The vendor content types should serialize identically to the non-vendor
-# content types. So to avoid littering the code with both options, we
-# map the vendor to the other when looking up the type
-_CONTENT_TYPE_MAP = {
-    'application/vnd.openstack.compute+json': 'application/json',
-    'application/vnd.openstack.compute+xml': 'application/xml',
-}
-
-SUPPORTED_CONTENT_TYPES = (
+_SUPPORTED_CONTENT_TYPES = (
     'application/json',
     'application/vnd.openstack.compute+json',
-    'application/xml',
-    'application/vnd.openstack.compute+xml',
 )
-
-_MEDIA_TYPE_MAP = {
-    'application/vnd.openstack.compute+json': 'json',
-    'application/json': 'json',
-    'application/vnd.openstack.compute+xml': 'xml',
-    'application/xml': 'xml',
-    'application/atom+xml': 'atom',
-}
 
 # These are typically automatically created by routes as either defaults
 # collection or member methods.
@@ -69,17 +48,54 @@ _ROUTES_METHODS = [
     'update',
 ]
 
+_METHODS_WITH_BODY = [
+    'POST',
+    'PUT',
+]
 
-class Request(webob.Request):
+# The default api version request if none is requested in the headers
+# Note(cyeoh): This only applies for the v2.1 API once microversions
+# support is fully merged. It does not affect the V2 API.
+DEFAULT_API_VERSION = "2.1"
+
+# name of attribute to keep version method information
+VER_METHOD_ATTR = 'versioned_methods'
+
+# Names of headers used by clients to request a specific version
+# of the REST API
+API_VERSION_REQUEST_HEADER = 'OpenStack-API-Version'
+LEGACY_API_VERSION_REQUEST_HEADER = 'X-OpenStack-Nova-API-Version'
+
+
+ENV_LEGACY_V2 = 'openstack.legacy_v2'
+
+
+def get_supported_content_types():
+    return _SUPPORTED_CONTENT_TYPES
+
+
+# NOTE(rlrossit): This function allows a get on both a dict-like and an
+# object-like object. cache_db_items() is used on both versioned objects and
+# dicts, so the function can't be totally changed over to [] syntax, nor
+# can it be changed over to use getattr().
+def item_get(item, item_key):
+    if hasattr(item, '__getitem__'):
+        return item[item_key]
+    else:
+        return getattr(item, item_key)
+
+
+class Request(wsgi.Request):
     """Add some OpenStack API-specific logic to the base webob.Request."""
 
     def __init__(self, *args, **kwargs):
         super(Request, self).__init__(*args, **kwargs)
         self._extension_data = {'db_items': {}}
+        if not hasattr(self, 'api_version_request'):
+            self.api_version_request = api_version.APIVersionRequest()
 
     def cache_db_items(self, key, items, item_key='id'):
-        """
-        Allow API methods to store objects from a DB query to be
+        """Allow API methods to store objects from a DB query to be
         used by API extensions within the same API request.
 
         An instance of this class only lives for the lifetime of a
@@ -88,11 +104,10 @@ class Request(webob.Request):
         """
         db_items = self._extension_data['db_items'].setdefault(key, {})
         for item in items:
-            db_items[item[item_key]] = item
+            db_items[item_get(item, item_key)] = item
 
     def get_db_items(self, key):
-        """
-        Allow an API extension to get previously stored objects within
+        """Allow an API extension to get previously stored objects within
         the same API request.
 
         Note that the object data will be slightly stale.
@@ -100,8 +115,7 @@ class Request(webob.Request):
         return self._extension_data['db_items'][key]
 
     def get_db_item(self, key, item_key):
-        """
-        Allow an API extension to get a previously stored object
+        """Allow an API extension to get a previously stored object
         within the same API request.
 
         Note that the object data will be slightly stale.
@@ -142,11 +156,12 @@ class Request(webob.Request):
             parts = self.path.rsplit('.', 1)
             if len(parts) > 1:
                 possible_type = 'application/' + parts[1]
-                if possible_type in SUPPORTED_CONTENT_TYPES:
+                if possible_type in get_supported_content_types():
                     content_type = possible_type
 
             if not content_type:
-                content_type = self.accept.best_match(SUPPORTED_CONTENT_TYPES)
+                content_type = self.accept.best_match(
+                    get_supported_content_types())
 
             self.environ['nova.best_content_type'] = (content_type or
                                                       'application/json')
@@ -170,10 +185,54 @@ class Request(webob.Request):
         if not content_type or content_type == 'text/plain':
             return None
 
-        if content_type not in SUPPORTED_CONTENT_TYPES:
+        if content_type not in get_supported_content_types():
             raise exception.InvalidContentType(content_type=content_type)
 
         return content_type
+
+    def best_match_language(self):
+        """Determine the best available language for the request.
+
+        :returns: the best language match or None if the 'Accept-Language'
+                  header was not available in the request.
+        """
+        if not self.accept_language:
+            return None
+        return self.accept_language.best_match(
+                i18n.get_available_languages())
+
+    def set_api_version_request(self):
+        """Set API version request based on the request header information."""
+        hdr_string = microversion_parse.get_version(
+            self.headers, service_type='compute',
+            legacy_headers=[LEGACY_API_VERSION_REQUEST_HEADER])
+
+        if hdr_string is None:
+            self.api_version_request = api_version.APIVersionRequest(
+                api_version.DEFAULT_API_VERSION)
+        elif hdr_string == 'latest':
+            # 'latest' is a special keyword which is equivalent to
+            # requesting the maximum version of the API supported
+            self.api_version_request = api_version.max_api_version()
+        else:
+            self.api_version_request = api_version.APIVersionRequest(
+                hdr_string)
+
+            # Check that the version requested is within the global
+            # minimum/maximum of supported API versions
+            if not self.api_version_request.matches(
+                    api_version.min_api_version(),
+                    api_version.max_api_version()):
+                raise exception.InvalidGlobalAPIVersion(
+                    req_ver=self.api_version_request.get_string(),
+                    min_ver=api_version.min_api_version().get_string(),
+                    max_ver=api_version.max_api_version().get_string())
+
+    def set_legacy_v2(self):
+        self.environ[ENV_LEGACY_V2] = True
+
+    def is_legacy_v2(self):
+        return self.environ.get(ENV_LEGACY_V2, False)
 
 
 class ActionDispatcher(object):
@@ -189,17 +248,7 @@ class ActionDispatcher(object):
         raise NotImplementedError()
 
 
-class TextDeserializer(ActionDispatcher):
-    """Default request body deserialization."""
-
-    def deserialize(self, datastring, action='default'):
-        return self.dispatch(datastring, action=action)
-
-    def default(self, datastring):
-        return {}
-
-
-class JSONDeserializer(TextDeserializer):
+class JSONDeserializer(ActionDispatcher):
 
     def _from_json(self, datastring):
         try:
@@ -208,265 +257,21 @@ class JSONDeserializer(TextDeserializer):
             msg = _("cannot understand JSON")
             raise exception.MalformedRequestBody(reason=msg)
 
+    def deserialize(self, datastring, action='default'):
+        return self.dispatch(datastring, action=action)
+
     def default(self, datastring):
         return {'body': self._from_json(datastring)}
 
 
-class XMLDeserializer(TextDeserializer):
-
-    def __init__(self, metadata=None):
-        """
-        :param metadata: information needed to deserialize xml into
-                         a dictionary.
-        """
-        super(XMLDeserializer, self).__init__()
-        self.metadata = metadata or {}
-
-    def _from_xml(self, datastring):
-        plurals = set(self.metadata.get('plurals', {}))
-        node = xmlutil.safe_minidom_parse_string(datastring).childNodes[0]
-        return {node.nodeName: self._from_xml_node(node, plurals)}
-
-    def _from_xml_node(self, node, listnames):
-        """Convert a minidom node to a simple Python type.
-
-        :param listnames: list of XML node names whose subnodes should
-                          be considered list items.
-
-        """
-        if len(node.childNodes) == 1 and node.childNodes[0].nodeType == 3:
-            return node.childNodes[0].nodeValue
-        elif node.nodeName in listnames:
-            return [self._from_xml_node(n, listnames) for n in node.childNodes]
-        else:
-            result = dict()
-            for attr in node.attributes.keys():
-                if not attr.startswith("xmlns"):
-                    result[attr] = node.attributes[attr].nodeValue
-            for child in node.childNodes:
-                if child.nodeType != node.TEXT_NODE:
-                    result[child.nodeName] = self._from_xml_node(child,
-                                                                 listnames)
-            return result
-
-    def find_first_child_named_in_namespace(self, parent, namespace, name):
-        """Search a nodes children for the first child with a given name."""
-        for node in parent.childNodes:
-            if (node.localName == name and
-                node.namespaceURI and
-                    node.namespaceURI == namespace):
-                return node
-        return None
-
-    def find_first_child_named(self, parent, name):
-        """Search a nodes children for the first child with a given name."""
-        for node in parent.childNodes:
-            if node.localName == name:
-                return node
-        return None
-
-    def find_children_named(self, parent, name):
-        """Return all of a nodes children who have the given name."""
-        for node in parent.childNodes:
-            if node.localName == name:
-                yield node
-
-    def extract_text(self, node):
-        """Get the text field contained by the given node."""
-        ret_val = ""
-        for child in node.childNodes:
-            if child.nodeType == child.TEXT_NODE:
-                ret_val += child.nodeValue
-        return ret_val
-
-    def extract_elements(self, node):
-        """Get only Element type childs from node."""
-        elements = []
-        for child in node.childNodes:
-            if child.nodeType == child.ELEMENT_NODE:
-                elements.append(child)
-        return elements
-
-    def find_attribute_or_element(self, parent, name):
-        """Get an attribute value; fallback to an element if not found."""
-        if parent.hasAttribute(name):
-            return parent.getAttribute(name)
-
-        node = self.find_first_child_named(parent, name)
-        if node:
-            return self.extract_text(node)
-
-        return None
-
-    def default(self, datastring):
-        return {'body': self._from_xml(datastring)}
-
-
-class MetadataXMLDeserializer(XMLDeserializer):
-
-    def extract_metadata(self, metadata_node):
-        """Marshal the metadata attribute of a parsed request."""
-        metadata = {}
-        if metadata_node is not None:
-            for meta_node in self.find_children_named(metadata_node, "meta"):
-                key = meta_node.getAttribute("key")
-                metadata[key] = self.extract_text(meta_node)
-        return metadata
-
-
-class DictSerializer(ActionDispatcher):
-    """Default request body serialization."""
+class JSONDictSerializer(ActionDispatcher):
+    """Default JSON request body serialization."""
 
     def serialize(self, data, action='default'):
         return self.dispatch(data, action=action)
 
     def default(self, data):
-        return ""
-
-
-class JSONDictSerializer(DictSerializer):
-    """Default JSON request body serialization."""
-
-    def default(self, data):
-        return jsonutils.dumps(data)
-
-
-class XMLDictSerializer(DictSerializer):
-
-    def __init__(self, metadata=None, xmlns=None):
-        """
-        :param metadata: information needed to deserialize xml into
-                         a dictionary.
-        :param xmlns: XML namespace to include with serialized xml
-        """
-        super(XMLDictSerializer, self).__init__()
-        self.metadata = metadata or {}
-        self.xmlns = xmlns
-
-    def default(self, data):
-        # We expect data to contain a single key which is the XML root.
-        root_key = data.keys()[0]
-        doc = minidom.Document()
-        node = self._to_xml_node(doc, self.metadata, root_key, data[root_key])
-
-        return self.to_xml_string(node)
-
-    def to_xml_string(self, node, has_atom=False):
-        self._add_xmlns(node, has_atom)
-        return node.toxml('UTF-8')
-
-    #NOTE (ameade): the has_atom should be removed after all of the
-    # xml serializers and view builders have been updated to the current
-    # spec that required all responses include the xmlns:atom, the has_atom
-    # flag is to prevent current tests from breaking
-    def _add_xmlns(self, node, has_atom=False):
-        if self.xmlns is not None:
-            node.setAttribute('xmlns', self.xmlns)
-        if has_atom:
-            node.setAttribute('xmlns:atom', "http://www.w3.org/2005/Atom")
-
-    def _to_xml_node(self, doc, metadata, nodename, data):
-        """Recursive method to convert data members to XML nodes."""
-        result = doc.createElement(nodename)
-
-        # Set the xml namespace if one is specified
-        # TODO(justinsb): We could also use prefixes on the keys
-        xmlns = metadata.get('xmlns', None)
-        if xmlns:
-            result.setAttribute('xmlns', xmlns)
-
-        #TODO(bcwaldon): accomplish this without a type-check
-        if isinstance(data, list):
-            collections = metadata.get('list_collections', {})
-            if nodename in collections:
-                metadata = collections[nodename]
-                for item in data:
-                    node = doc.createElement(metadata['item_name'])
-                    node.setAttribute(metadata['item_key'], str(item))
-                    result.appendChild(node)
-                return result
-            singular = metadata.get('plurals', {}).get(nodename, None)
-            if singular is None:
-                if nodename.endswith('s'):
-                    singular = nodename[:-1]
-                else:
-                    singular = 'item'
-            for item in data:
-                node = self._to_xml_node(doc, metadata, singular, item)
-                result.appendChild(node)
-        #TODO(bcwaldon): accomplish this without a type-check
-        elif isinstance(data, dict):
-            collections = metadata.get('dict_collections', {})
-            if nodename in collections:
-                metadata = collections[nodename]
-                for k, v in data.items():
-                    node = doc.createElement(metadata['item_name'])
-                    node.setAttribute(metadata['item_key'], str(k))
-                    text = doc.createTextNode(str(v))
-                    node.appendChild(text)
-                    result.appendChild(node)
-                return result
-            attrs = metadata.get('attributes', {}).get(nodename, {})
-            for k, v in data.items():
-                if k in attrs:
-                    result.setAttribute(k, str(v))
-                else:
-                    if k == "deleted":
-                        v = str(bool(v))
-                    node = self._to_xml_node(doc, metadata, k, v)
-                    result.appendChild(node)
-        else:
-            # Type is atom
-            node = doc.createTextNode(str(data))
-            result.appendChild(node)
-        return result
-
-    def _create_link_nodes(self, xml_doc, links):
-        link_nodes = []
-        for link in links:
-            link_node = xml_doc.createElement('atom:link')
-            link_node.setAttribute('rel', link['rel'])
-            link_node.setAttribute('href', link['href'])
-            if 'type' in link:
-                link_node.setAttribute('type', link['type'])
-            link_nodes.append(link_node)
-        return link_nodes
-
-    def _to_xml(self, root):
-        """Convert the xml object to an xml string."""
-        return etree.tostring(root, encoding='UTF-8', xml_declaration=True)
-
-
-def serializers(**serializers):
-    """Attaches serializers to a method.
-
-    This decorator associates a dictionary of serializers with a
-    method.  Note that the function attributes are directly
-    manipulated; the method is not wrapped.
-    """
-
-    def decorator(func):
-        if not hasattr(func, 'wsgi_serializers'):
-            func.wsgi_serializers = {}
-        func.wsgi_serializers.update(serializers)
-        return func
-    return decorator
-
-
-def deserializers(**deserializers):
-    """Attaches deserializers to a method.
-
-    This decorator associates a dictionary of deserializers with a
-    method.  Note that the function attributes are directly
-    manipulated; the method is not wrapped.
-    """
-
-    def decorator(func):
-        if not hasattr(func, 'wsgi_deserializers'):
-            func.wsgi_deserializers = {}
-        func.wsgi_deserializers.update(deserializers)
-        return func
-    return decorator
+        return six.text_type(jsonutils.dumps(data))
 
 
 def response(code):
@@ -484,29 +289,21 @@ def response(code):
 
 
 class ResponseObject(object):
-    """Bundles a response object with appropriate serializers.
+    """Bundles a response object
 
-    Object that app methods may return in order to bind alternate
-    serializers with a response object to be serialized.  Its use is
-    optional.
+    Object that app methods may return in order to allow its response
+    to be modified by extensions in the code. Its use is optional (and
+    should only be used if you really know what you are doing).
     """
 
-    def __init__(self, obj, code=None, headers=None, **serializers):
-        """Binds serializers with an object.
-
-        Takes keyword arguments akin to the @serializer() decorator
-        for specifying serializers.  Serializers specified will be
-        given preference over default serializers or method-specific
-        serializers on return.
-        """
+    def __init__(self, obj, code=None, headers=None):
+        """Builds a response object."""
 
         self.obj = obj
-        self.serializers = serializers
         self._default_code = 200
         self._code = code
         self._headers = headers or {}
-        self.serializer = None
-        self.media_type = None
+        self.serializer = JSONDictSerializer()
 
     def __getitem__(self, key):
         """Retrieves a header with the given name."""
@@ -523,85 +320,41 @@ class ResponseObject(object):
 
         del self._headers[key.lower()]
 
-    def _bind_method_serializers(self, meth_serializers):
-        """Binds method serializers with the response object.
-
-        Binds the method serializers with the response object.
-        Serializers specified to the constructor will take precedence
-        over serializers specified to this method.
-
-        :param meth_serializers: A dictionary with keys mapping to
-                                 response types and values containing
-                                 serializer objects.
-        """
-
-        # We can't use update because that would be the wrong
-        # precedence
-        for mtype, serializer in meth_serializers.items():
-            self.serializers.setdefault(mtype, serializer)
-
-    def get_serializer(self, content_type, default_serializers=None):
-        """Returns the serializer for the wrapped object.
-
-        Returns the serializer for the wrapped object subject to the
-        indicated content type.  If no serializer matching the content
-        type is attached, an appropriate serializer drawn from the
-        default serializers will be used.  If no appropriate
-        serializer is available, raises InvalidContentType.
-        """
-
-        default_serializers = default_serializers or {}
-
-        try:
-            mtype = _MEDIA_TYPE_MAP.get(content_type, content_type)
-            if mtype in self.serializers:
-                return mtype, self.serializers[mtype]
-            else:
-                return mtype, default_serializers[mtype]
-        except (KeyError, TypeError):
-            raise exception.InvalidContentType(content_type=content_type)
-
-    def preserialize(self, content_type, default_serializers=None):
-        """Prepares the serializer that will be used to serialize.
-
-        Determines the serializer that will be used and prepares an
-        instance of it for later call.  This allows the serializer to
-        be accessed by extensions for, e.g., template extension.
-        """
-
-        mtype, serializer = self.get_serializer(content_type,
-                                                default_serializers)
-        self.media_type = mtype
-        self.serializer = serializer()
-
-    def attach(self, **kwargs):
-        """Attach slave templates to serializers."""
-
-        if self.media_type in kwargs:
-            self.serializer.attach(kwargs[self.media_type])
-
-    def serialize(self, request, content_type, default_serializers=None):
+    def serialize(self, request, content_type):
         """Serializes the wrapped object.
 
         Utility method for serializing the wrapped object.  Returns a
         webob.Response object.
         """
 
-        if self.serializer:
-            serializer = self.serializer
-        else:
-            _mtype, _serializer = self.get_serializer(content_type,
-                                                      default_serializers)
-            serializer = _serializer()
+        serializer = self.serializer
 
-        response = webob.Response()
-        response.status_int = self.code
-        for hdr, value in self._headers.items():
-            response.headers[hdr] = str(value)
-        response.headers['Content-Type'] = content_type
+        body = None
         if self.obj is not None:
-            response.body = serializer.serialize(self.obj)
-
+            body = serializer.serialize(self.obj)
+        response = webob.Response(body=body)
+        response.status_int = self.code
+        for hdr, val in self._headers.items():
+            if not isinstance(val, six.text_type):
+                val = six.text_type(val)
+            if six.PY2:
+                # In Py2.X Headers must be byte strings
+                response.headers[hdr] = encodeutils.safe_encode(val)
+            else:
+                # In Py3.X Headers must be utf-8 strings
+                response.headers[hdr] = encodeutils.safe_decode(
+                        encodeutils.safe_encode(val))
+        # Deal with content_type
+        if not isinstance(content_type, six.text_type):
+            content_type = six.text_type(content_type)
+        if six.PY2:
+            # In Py2.X Headers must be byte strings
+            response.headers['Content-Type'] = encodeutils.safe_encode(
+                content_type)
+        else:
+            # In Py3.X Headers must be utf-8 strings
+            response.headers['Content-Type'] = encodeutils.safe_decode(
+                    encodeutils.safe_encode(content_type))
         return response
 
     @property
@@ -617,8 +370,12 @@ class ResponseObject(object):
         return self._headers.copy()
 
 
-def action_peek_json(body):
-    """Determine action to invoke."""
+def action_peek(body):
+    """Determine action to invoke.
+
+    This looks inside the json body and fetches out the action method
+    name.
+    """
 
     try:
         decoded = jsonutils.loads(body)
@@ -631,17 +388,8 @@ def action_peek_json(body):
         msg = _("too many body keys")
         raise exception.MalformedRequestBody(reason=msg)
 
-    # Return the action and the decoded body...
-    return decoded.keys()[0]
-
-
-def action_peek_xml(body):
-    """Determine action to invoke."""
-
-    dom = xmlutil.safe_minidom_parse_string(body)
-    action_node = dom.childNodes[0]
-
-    return action_node.tagName
+    # Return the action name
+    return list(decoded.keys())[0]
 
 
 class ResourceExceptionHandler(object):
@@ -659,27 +407,25 @@ class ResourceExceptionHandler(object):
         if not ex_value:
             return True
 
-        if isinstance(ex_value, exception.NotAuthorized):
-            msg = unicode(ex_value.message % ex_value.kwargs)
-            raise Fault(webob.exc.HTTPForbidden(explanation=msg))
+        if isinstance(ex_value, exception.Forbidden):
+            raise Fault(webob.exc.HTTPForbidden(
+                    explanation=ex_value.format_message()))
+        elif isinstance(ex_value, exception.VersionNotFoundForAPIMethod):
+            raise
         elif isinstance(ex_value, exception.Invalid):
-            msg = unicode(ex_value.message % ex_value.kwargs)
             raise Fault(exception.ConvertedException(
-                    code=ex_value.code, explanation=msg))
-
-        # Under python 2.6, TypeError's exception value is actually a string,
-        # so test # here via ex_type instead:
-        # http://bugs.python.org/issue7853
-        elif issubclass(ex_type, TypeError):
+                    code=ex_value.code,
+                    explanation=ex_value.format_message()))
+        elif isinstance(ex_value, TypeError):
             exc_info = (ex_type, ex_value, ex_traceback)
-            LOG.error(_('Exception handling resource: %s') % ex_value,
-                    exc_info=exc_info)
+            LOG.error('Exception handling resource: %s', ex_value,
+                      exc_info=exc_info)
             raise Fault(webob.exc.HTTPBadRequest())
         elif isinstance(ex_value, Fault):
-            LOG.info(_("Fault thrown: %s"), unicode(ex_value))
+            LOG.info("Fault thrown: %s", ex_value)
             raise ex_value
         elif isinstance(ex_value, webob.exc.HTTPException):
-            LOG.info(_("HTTP exception thrown: %s"), unicode(ex_value))
+            LOG.info("HTTP exception thrown: %s", ex_value)
             raise Fault(ex_value)
 
         # We didn't handle the exception
@@ -701,32 +447,16 @@ class Resource(wsgi.Application):
     wrapped in Fault() to provide API friendly error responses.
 
     """
+    support_api_request_version = True
 
-    def __init__(self, controller, action_peek=None, inherits=None,
-                 **deserializers):
-        """
-        :param controller: object that implement methods created by routes lib
-        :param action_peek: dictionary of routines for peeking into an action
-                            request body to determine the desired action
-        :param inherits: another resource object that this resource should
-                         inherit extensions from. Any action extensions that
-                         are applied to the parent resource will also apply
-                         to this resource.
+    def __init__(self, controller):
+        """:param controller: object that implement methods created by routes
+                              lib
         """
 
         self.controller = controller
 
-        default_deserializers = dict(xml=XMLDeserializer,
-                                     json=JSONDeserializer)
-        default_deserializers.update(deserializers)
-
-        self.default_deserializers = default_deserializers
-        self.default_serializers = dict(xml=XMLDictSerializer,
-                                        json=JSONDictSerializer)
-
-        self.action_peek = dict(xml=action_peek_xml,
-                                json=action_peek_json)
-        self.action_peek.update(action_peek or {})
+        self.default_serializers = dict(json=JSONDictSerializer)
 
         # Copy over the actions dictionary
         self.wsgi_actions = {}
@@ -736,7 +466,6 @@ class Resource(wsgi.Application):
         # Save a mapping of extensions
         self.wsgi_extensions = {}
         self.wsgi_action_extensions = {}
-        self.inherits = inherits
 
     def register_actions(self, controller):
         """Registers controller actions with this resource."""
@@ -790,109 +519,68 @@ class Resource(wsgi.Application):
         return args
 
     def get_body(self, request):
-        try:
-            content_type = request.get_content_type()
-        except exception.InvalidContentType:
-            LOG.debug(_("Unrecognized Content-Type provided in request"))
-            return None, ''
-
-        if not content_type:
-            LOG.debug(_("No Content-Type provided in request"))
-            return None, ''
-
-        if len(request.body) <= 0:
-            LOG.debug(_("Empty body provided in request"))
-            return None, ''
+        content_type = request.get_content_type()
 
         return content_type, request.body
 
-    def deserialize(self, meth, content_type, body):
-        meth_deserializers = getattr(meth, 'wsgi_deserializers', {})
-        try:
-            mtype = _MEDIA_TYPE_MAP.get(content_type, content_type)
-            if mtype in meth_deserializers:
-                deserializer = meth_deserializers[mtype]
-            else:
-                deserializer = self.default_deserializers[mtype]
-        except (KeyError, TypeError):
-            raise exception.InvalidContentType(content_type=content_type)
+    def deserialize(self, body):
+        return JSONDeserializer().deserialize(body)
 
-        if (hasattr(deserializer, 'want_controller')
-                and deserializer.want_controller):
-            return deserializer(self.controller).deserialize(body)
-        else:
-            return deserializer().deserialize(body)
-
-    def pre_process_extensions(self, extensions, request, action_args):
-        # List of callables for post-processing extensions
-        post = []
-
-        for ext in extensions:
-            if inspect.isgeneratorfunction(ext):
-                response = None
-
-                # If it's a generator function, the part before the
-                # yield is the preprocessing stage
-                try:
-                    with ResourceExceptionHandler():
-                        gen = ext(req=request, **action_args)
-                        response = gen.next()
-                except Fault as ex:
-                    response = ex
-
-                # We had a response...
-                if response:
-                    return response, []
-
-                # No response, queue up generator for post-processing
-                post.append(gen)
-            else:
-                # Regular functions only perform post-processing
-                post.append(ext)
-
-        # Run post-processing in the reverse order
-        return None, reversed(post)
-
-    def post_process_extensions(self, extensions, resp_obj, request,
-                                action_args):
+    def process_extensions(self, extensions, resp_obj, request,
+                           action_args):
         for ext in extensions:
             response = None
-            if inspect.isgenerator(ext):
-                # If it's a generator, run the second half of
-                # processing
-                try:
-                    with ResourceExceptionHandler():
-                        response = ext.send(resp_obj)
-                except StopIteration:
-                    # Normal exit of generator
-                    continue
-                except Fault as ex:
-                    response = ex
-            else:
-                # Regular functions get post-processing...
-                try:
-                    with ResourceExceptionHandler():
-                        response = ext(req=request, resp_obj=resp_obj,
-                                       **action_args)
-                except Fault as ex:
-                    response = ex
+            # Regular functions get post-processing...
+            try:
+                with ResourceExceptionHandler():
+                    response = ext(req=request, resp_obj=resp_obj,
+                                   **action_args)
+            except exception.VersionNotFoundForAPIMethod:
+                # If an attached extension (@wsgi.extends) for the
+                # method has no version match its not an error. We
+                # just don't run the extends code
+                continue
+            except Fault as ex:
+                response = ex
 
-            # We had a response...
+            # We had a response return it, to exit early. This is
+            # actually a failure mode. None is success.
             if response:
                 return response
 
         return None
 
+    def _should_have_body(self, request):
+        return request.method in _METHODS_WITH_BODY
+
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, request):
         """WSGI method that controls (de)serialization and method dispatch."""
+
+        if self.support_api_request_version:
+            # Set the version of the API requested based on the header
+            try:
+                request.set_api_version_request()
+            except exception.InvalidAPIVersionString as e:
+                return Fault(webob.exc.HTTPBadRequest(
+                    explanation=e.format_message()))
+            except exception.InvalidGlobalAPIVersion as e:
+                return Fault(webob.exc.HTTPNotAcceptable(
+                    explanation=e.format_message()))
 
         # Identify the action, its arguments, and the requested
         # content type
         action_args = self.get_action_args(request.environ)
         action = action_args.pop('action', None)
-        content_type, body = self.get_body(request)
-        accept = request.best_match_content_type()
+
+        # NOTE(sdague): we filter out InvalidContentTypes early so we
+        # know everything is good from here on out.
+        try:
+            content_type, body = self.get_body(request)
+            accept = request.best_match_content_type()
+        except exception.InvalidContentType:
+            msg = _("Unsupported Content-Type")
+            return Fault(webob.exc.HTTPUnsupportedMediaType(explanation=msg))
 
         # NOTE(Vek): Splitting the function up this way allows for
         #            auditing by external tools that wrap the existing
@@ -920,21 +608,18 @@ class Resource(wsgi.Application):
             return Fault(webob.exc.HTTPBadRequest(explanation=msg))
 
         if body:
-            msg = _("Action: '%(action)s', body: "
+            msg = _("Action: '%(action)s', calling method: %(meth)s, body: "
                     "%(body)s") % {'action': action,
-                                   'body': unicode(body, 'utf-8')}
-            LOG.debug(msg)
-        LOG.debug(_("Calling method %s") % meth)
+                                   'body': six.text_type(body, 'utf-8'),
+                                   'meth': str(meth)}
+            LOG.debug(strutils.mask_password(msg))
+        else:
+            LOG.debug("Calling method '%(meth)s'",
+                      {'meth': str(meth)})
 
         # Now, deserialize the request body...
         try:
-            if content_type:
-                contents = self.deserialize(meth, content_type, body)
-            else:
-                contents = {}
-        except exception.InvalidContentType:
-            msg = _("Unsupported Content-Type")
-            return Fault(webob.exc.HTTPBadRequest(explanation=msg))
+            contents = self._get_request_content(body, request)
         except exception.MalformedRequestBody:
             msg = _("Malformed request body")
             return Fault(webob.exc.HTTPBadRequest(explanation=msg))
@@ -952,16 +637,12 @@ class Resource(wsgi.Application):
                      'context_project_id': context.project_id}
             return Fault(webob.exc.HTTPBadRequest(explanation=msg))
 
-        # Run pre-processing extensions
-        response, post = self.pre_process_extensions(extensions,
-                                                     request, action_args)
-
-        if not response:
-            try:
-                with ResourceExceptionHandler():
-                    action_result = self.dispatch(meth, request, action_args)
-            except Fault as ex:
-                response = ex
+        response = None
+        try:
+            with ResourceExceptionHandler():
+                action_result = self.dispatch(meth, request, action_args)
+        except Fault as ex:
+            response = ex
 
         if not response:
             # No exceptions; convert action_result into a
@@ -977,41 +658,56 @@ class Resource(wsgi.Application):
             # Run post-processing extensions
             if resp_obj:
                 # Do a preserialize to set up the response object
-                serializers = getattr(meth, 'wsgi_serializers', {})
-                resp_obj._bind_method_serializers(serializers)
                 if hasattr(meth, 'wsgi_code'):
                     resp_obj._default_code = meth.wsgi_code
-                resp_obj.preserialize(accept, self.default_serializers)
-
-                # Process post-processing extensions
-                response = self.post_process_extensions(post, resp_obj,
+                # Process extensions
+                response = self.process_extensions(extensions, resp_obj,
                                                         request, action_args)
 
             if resp_obj and not response:
-                response = resp_obj.serialize(request, accept,
-                                              self.default_serializers)
+                response = resp_obj.serialize(request, accept)
 
-        if context and hasattr(response, 'headers'):
-            response.headers.add('x-compute-request-id', context.request_id)
+        if hasattr(response, 'headers'):
+            for hdr, val in list(response.headers.items()):
+                if not isinstance(val, six.text_type):
+                    val = six.text_type(val)
+                if six.PY2:
+                    # In Py2.X Headers must be byte strings
+                    response.headers[hdr] = encodeutils.safe_encode(val)
+                else:
+                    # In Py3.X Headers must be utf-8 strings
+                    response.headers[hdr] = encodeutils.safe_decode(
+                            encodeutils.safe_encode(val))
+
+            if not request.api_version_request.is_null():
+                response.headers[API_VERSION_REQUEST_HEADER] = \
+                    'compute ' + request.api_version_request.get_string()
+                response.headers[LEGACY_API_VERSION_REQUEST_HEADER] = \
+                    request.api_version_request.get_string()
+                response.headers.add('Vary', API_VERSION_REQUEST_HEADER)
+                response.headers.add('Vary', LEGACY_API_VERSION_REQUEST_HEADER)
 
         return response
+
+    def _get_request_content(self, body, request):
+        contents = {}
+        if self._should_have_body(request):
+            # allow empty body with PUT and POST
+            if request.content_length == 0 or request.content_length is None:
+                contents = {'body': None}
+            else:
+                contents = self.deserialize(body)
+        return contents
 
     def get_method(self, request, action, content_type, body):
         meth, extensions = self._get_method(request,
                                             action,
                                             content_type,
                                             body)
-        if self.inherits:
-            _meth, parent_ext = self.inherits.get_method(request,
-                                                         action,
-                                                         content_type,
-                                                         body)
-            extensions.extend(parent_ext)
         return meth, extensions
 
     def _get_method(self, request, action, content_type, body):
         """Look up the action-specific method and its extensions."""
-
         # Look up the method
         try:
             if not self.controller:
@@ -1027,9 +723,7 @@ class Resource(wsgi.Application):
             return meth, self.wsgi_extensions.get(action, [])
 
         if action == 'action':
-            # OK, it's an action; figure out which action...
-            mtype = _MEDIA_TYPE_MAP.get(content_type)
-            action_name = self.action_peek[mtype](body)
+            action_name = action_peek(body)
         else:
             action_name = action
 
@@ -1040,7 +734,13 @@ class Resource(wsgi.Application):
     def dispatch(self, method, request, action_args):
         """Dispatch a call to the action-specific method."""
 
-        return method(req=request, **action_args)
+        try:
+            return method(req=request, **action_args)
+        except exception.VersionNotFoundForAPIMethod:
+            # We deliberately don't return any message information
+            # about the exception to the user so it looks as if
+            # the method is simply not implemented.
+            return Fault(webob.exc.HTTPNotFound())
 
 
 def action(name):
@@ -1087,6 +787,56 @@ def extends(*args, **kwargs):
     return decorator
 
 
+def expected_errors(errors):
+    """Decorator for v2.1 API methods which specifies expected exceptions.
+
+    Specify which exceptions may occur when an API method is called. If an
+    unexpected exception occurs then return a 500 instead and ask the user
+    of the API to file a bug report.
+    """
+    def decorator(f):
+        @functools.wraps(f)
+        def wrapped(*args, **kwargs):
+            try:
+                return f(*args, **kwargs)
+            except Exception as exc:
+                if isinstance(exc, webob.exc.WSGIHTTPException):
+                    if isinstance(errors, int):
+                        t_errors = (errors,)
+                    else:
+                        t_errors = errors
+                    if exc.code in t_errors:
+                        raise
+                elif isinstance(exc, exception.Forbidden):
+                    # Note(cyeoh): Special case to handle
+                    # Forbidden exceptions so every
+                    # extension method does not need to wrap authorize
+                    # calls. ResourceExceptionHandler silently
+                    # converts NotAuthorized to HTTPForbidden
+                    raise
+                elif isinstance(exc, exception.ValidationError):
+                    # Note(oomichi): Handle a validation error, which
+                    # happens due to invalid API parameters, as an
+                    # expected error.
+                    raise
+                elif isinstance(exc, exception.Unauthorized):
+                    # Handle an authorized exception, will be
+                    # automatically converted to a HTTP 401, clients
+                    # like python-novaclient handle this error to
+                    # generate new token and do another attempt.
+                    raise
+
+                LOG.exception("Unexpected exception in API method")
+                msg = _('Unexpected API Error. Please report this at '
+                    'http://bugs.launchpad.net/nova/ and attach the Nova '
+                    'API log if possible.\n%s') % type(exc)
+                raise webob.exc.HTTPInternalServerError(explanation=msg)
+
+        return wrapped
+
+    return decorator
+
+
 class ControllerMetaclass(type):
     """Controller metaclass.
 
@@ -1100,9 +850,22 @@ class ControllerMetaclass(type):
         # Find all actions
         actions = {}
         extensions = []
+        versioned_methods = None
         # start with wsgi actions from base classes
         for base in bases:
             actions.update(getattr(base, 'wsgi_actions', {}))
+
+            if base.__name__ == "Controller":
+                # NOTE(cyeoh): This resets the VER_METHOD_ATTR attribute
+                # between API controller class creations. This allows us
+                # to use a class decorator on the API methods that doesn't
+                # require naming explicitly what method is being versioned as
+                # it can be implicit based on the method decorated. It is a bit
+                # ugly.
+                if VER_METHOD_ATTR in base.__dict__:
+                    versioned_methods = getattr(base, VER_METHOD_ATTR)
+                    delattr(base, VER_METHOD_ATTR)
+
         for key, value in cls_dict.items():
             if not callable(value):
                 continue
@@ -1114,15 +877,16 @@ class ControllerMetaclass(type):
         # Add the actions and extensions to the class dict
         cls_dict['wsgi_actions'] = actions
         cls_dict['wsgi_extensions'] = extensions
+        if versioned_methods:
+            cls_dict[VER_METHOD_ATTR] = versioned_methods
 
         return super(ControllerMetaclass, mcs).__new__(mcs, name, bases,
                                                        cls_dict)
 
 
+@six.add_metaclass(ControllerMetaclass)
 class Controller(object):
     """Default controller."""
-
-    __metaclass__ = ControllerMetaclass
 
     _view_builder_class = None
 
@@ -1134,6 +898,103 @@ class Controller(object):
             self._view_builder = self._view_builder_class()
         else:
             self._view_builder = None
+
+    def __getattribute__(self, key):
+
+        def version_select(*args, **kwargs):
+            """Look for the method which matches the name supplied and version
+            constraints and calls it with the supplied arguments.
+
+            @return: Returns the result of the method called
+            @raises: VersionNotFoundForAPIMethod if there is no method which
+                 matches the name and version constraints
+            """
+
+            # The first arg to all versioned methods is always the request
+            # object. The version for the request is attached to the
+            # request object
+            if len(args) == 0:
+                ver = kwargs['req'].api_version_request
+            else:
+                ver = args[0].api_version_request
+
+            func_list = self.versioned_methods[key]
+            for func in func_list:
+                if ver.matches(func.start_version, func.end_version):
+                    # Update the version_select wrapper function so
+                    # other decorator attributes like wsgi.response
+                    # are still respected.
+                    functools.update_wrapper(version_select, func.func)
+                    return func.func(self, *args, **kwargs)
+
+            # No version match
+            raise exception.VersionNotFoundForAPIMethod(version=ver)
+
+        try:
+            version_meth_dict = object.__getattribute__(self, VER_METHOD_ATTR)
+        except AttributeError:
+            # No versioning on this class
+            return object.__getattribute__(self, key)
+
+        if version_meth_dict and \
+          key in object.__getattribute__(self, VER_METHOD_ATTR):
+            return version_select
+
+        return object.__getattribute__(self, key)
+
+    # NOTE(cyeoh): This decorator MUST appear first (the outermost
+    # decorator) on an API method for it to work correctly
+    @classmethod
+    def api_version(cls, min_ver, max_ver=None):
+        """Decorator for versioning api methods.
+
+        Add the decorator to any method which takes a request object
+        as the first parameter and belongs to a class which inherits from
+        wsgi.Controller.
+
+        @min_ver: string representing minimum version
+        @max_ver: optional string representing maximum version
+        """
+
+        def decorator(f):
+            obj_min_ver = api_version.APIVersionRequest(min_ver)
+            if max_ver:
+                obj_max_ver = api_version.APIVersionRequest(max_ver)
+            else:
+                obj_max_ver = api_version.APIVersionRequest()
+
+            # Add to list of versioned methods registered
+            func_name = f.__name__
+            new_func = versioned_method.VersionedMethod(
+                func_name, obj_min_ver, obj_max_ver, f)
+
+            func_dict = getattr(cls, VER_METHOD_ATTR, {})
+            if not func_dict:
+                setattr(cls, VER_METHOD_ATTR, func_dict)
+
+            func_list = func_dict.get(func_name, [])
+            if not func_list:
+                func_dict[func_name] = func_list
+            func_list.append(new_func)
+            # Ensure the list is sorted by minimum version (reversed)
+            # so later when we work through the list in order we find
+            # the method which has the latest version which supports
+            # the version requested.
+            is_intersect = Controller.check_for_versions_intersection(
+                func_list)
+
+            if is_intersect:
+                raise exception.ApiVersionsIntersect(
+                    name=new_func.name,
+                    min_ver=new_func.start_version,
+                    max_ver=new_func.end_version,
+                )
+
+            func_list.sort(key=lambda f: f.start_version, reverse=True)
+
+            return f
+
+        return decorator
 
     @staticmethod
     def is_valid_body(body, entity_name):
@@ -1147,10 +1008,37 @@ class Controller(object):
             except AttributeError:
                 return False
 
-        if not is_dict(body[entity_name]):
-            return False
+        return is_dict(body[entity_name])
 
-        return True
+    @staticmethod
+    def check_for_versions_intersection(func_list):
+        """Determines whether function list contains version intervals
+        intersections or not. General algorithm:
+
+        https://en.wikipedia.org/wiki/Intersection_algorithm
+
+        :param func_list: list of VersionedMethod objects
+        :return: boolean
+        """
+        pairs = []
+        counter = 0
+
+        for f in func_list:
+            pairs.append((f.start_version, 1, f))
+            pairs.append((f.end_version, -1, f))
+
+        def compare(x):
+            return x[0]
+
+        pairs.sort(key=compare)
+
+        for p in pairs:
+            counter += p[1]
+
+            if counter > 1:
+                return True
+
+        return False
 
 
 class Fault(webob.exc.HTTPException):
@@ -1165,106 +1053,53 @@ class Fault(webob.exc.HTTPException):
             409: "conflictingRequest",
             413: "overLimit",
             415: "badMediaType",
+            429: "overLimit",
             501: "notImplemented",
             503: "serviceUnavailable"}
 
     def __init__(self, exception):
         """Create a Fault for the given webob.exc.exception."""
         self.wrapped_exc = exception
-        for key, value in self.wrapped_exc.headers.items():
+        for key, value in list(self.wrapped_exc.headers.items()):
             self.wrapped_exc.headers[key] = str(value)
         self.status_int = exception.status_int
 
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, req):
         """Generate a WSGI response based on the exception passed to ctor."""
+
+        user_locale = req.best_match_language()
         # Replace the body with fault details.
         code = self.wrapped_exc.status_int
         fault_name = self._fault_names.get(code, "computeFault")
         explanation = self.wrapped_exc.explanation
-        LOG.debug(_("Returning %(code)s to user: %(explanation)s"),
+        LOG.debug("Returning %(code)s to user: %(explanation)s",
                   {'code': code, 'explanation': explanation})
 
+        explanation = i18n.translate(explanation, user_locale)
         fault_data = {
             fault_name: {
                 'code': code,
                 'message': explanation}}
-        if code == 413:
+        if code == 413 or code == 429:
             retry = self.wrapped_exc.headers.get('Retry-After', None)
             if retry:
                 fault_data[fault_name]['retryAfter'] = retry
 
-        # 'code' is an attribute on the fault tag itself
-        metadata = {'attributes': {fault_name: 'code'}}
+        if not req.api_version_request.is_null():
+            self.wrapped_exc.headers[API_VERSION_REQUEST_HEADER] = \
+                'compute ' + req.api_version_request.get_string()
+            self.wrapped_exc.headers[LEGACY_API_VERSION_REQUEST_HEADER] = \
+                req.api_version_request.get_string()
+            self.wrapped_exc.headers.add('Vary', API_VERSION_REQUEST_HEADER)
+            self.wrapped_exc.headers.add('Vary',
+                                         LEGACY_API_VERSION_REQUEST_HEADER)
 
-        xml_serializer = XMLDictSerializer(metadata, XMLNS_V11)
-
-        content_type = req.best_match_content_type()
-        serializer = {
-            'application/xml': xml_serializer,
-            'application/json': JSONDictSerializer(),
-        }[content_type]
-
-        self.wrapped_exc.body = serializer.serialize(fault_data)
-        self.wrapped_exc.content_type = content_type
-        _set_request_id_header(req, self.wrapped_exc.headers)
+        self.wrapped_exc.content_type = 'application/json'
+        self.wrapped_exc.charset = 'UTF-8'
+        self.wrapped_exc.text = JSONDictSerializer().serialize(fault_data)
 
         return self.wrapped_exc
 
     def __str__(self):
         return self.wrapped_exc.__str__()
-
-
-class OverLimitFault(webob.exc.HTTPException):
-    """
-    Rate-limited request response.
-    """
-
-    def __init__(self, message, details, retry_time):
-        """
-        Initialize new `OverLimitFault` with relevant information.
-        """
-        hdrs = OverLimitFault._retry_after(retry_time)
-        self.wrapped_exc = webob.exc.HTTPRequestEntityTooLarge(headers=hdrs)
-        self.content = {
-            "overLimit": {
-                "code": self.wrapped_exc.status_int,
-                "message": message,
-                "details": details,
-                "retryAfter": hdrs['Retry-After'],
-            },
-        }
-
-    @staticmethod
-    def _retry_after(retry_time):
-        delay = int(math.ceil(retry_time - time.time()))
-        retry_after = delay if delay > 0 else 0
-        headers = {'Retry-After': '%d' % retry_after}
-        return headers
-
-    @webob.dec.wsgify(RequestClass=Request)
-    def __call__(self, request):
-        """
-        Return the wrapped exception with a serialized body conforming to our
-        error format.
-        """
-        content_type = request.best_match_content_type()
-        metadata = {"attributes": {"overLimit": ["code", "retryAfter"]}}
-
-        xml_serializer = XMLDictSerializer(metadata, XMLNS_V11)
-        serializer = {
-            'application/xml': xml_serializer,
-            'application/json': JSONDictSerializer(),
-        }[content_type]
-
-        content = serializer.serialize(self.content)
-        self.wrapped_exc.body = content
-        self.wrapped_exc.content_type = content_type
-
-        return self.wrapped_exc
-
-
-def _set_request_id_header(req, headers):
-    context = req.environ.get('nova.context')
-    if context:
-        headers['x-compute-request-id'] = context.request_id

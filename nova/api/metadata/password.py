@@ -13,10 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import six
+from six.moves import range
 from webob import exc
 
-from nova import conductor
 from nova import context
+from nova import exception
+from nova.i18n import _
+from nova import objects
 from nova import utils
 
 
@@ -40,8 +44,11 @@ def convert_password(context, password):
     Password is stored with the keys 'password_0' -> 'password_3'.
     """
     password = password or ''
+    if six.PY3 and isinstance(password, bytes):
+        password = password.decode('utf-8')
+
     meta = {}
-    for i in xrange(CHUNKS):
+    for i in range(CHUNKS):
         meta['password_%d' % i] = password[:CHUNK_LENGTH]
         password = password[CHUNK_LENGTH:]
     return meta
@@ -61,11 +68,14 @@ def handle_password(req, meta_data):
             msg = _("Request is too large.")
             raise exc.HTTPBadRequest(explanation=msg)
 
-        conductor_api = conductor.API()
-        instance = conductor_api.instance_get_by_uuid(ctxt, meta_data.uuid)
-        sys_meta = utils.metadata_to_dict(instance['system_metadata'])
-        sys_meta.update(convert_password(ctxt, req.body))
-        conductor_api.instance_update(ctxt, meta_data.uuid,
-                                      system_metadata=sys_meta)
+        im = objects.InstanceMapping.get_by_instance_uuid(ctxt, meta_data.uuid)
+        with context.target_cell(ctxt, im.cell_mapping) as cctxt:
+            try:
+                instance = objects.Instance.get_by_uuid(cctxt, meta_data.uuid)
+            except exception.InstanceNotFound as e:
+                raise exc.HTTPBadRequest(explanation=e.format_message())
+        instance.system_metadata.update(convert_password(ctxt, req.body))
+        instance.save()
     else:
-        raise exc.HTTPBadRequest()
+        msg = _("GET and POST only are supported.")
+        raise exc.HTTPBadRequest(explanation=msg)

@@ -1,6 +1,4 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
-# Copyright 2012, Red Hat, Inc.
+# Copyright 2013, Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -18,126 +16,168 @@
 Client side of the scheduler manager RPC API.
 """
 
-from oslo.config import cfg
+import oslo_messaging as messaging
 
-from nova.openstack.common import jsonutils
-import nova.openstack.common.rpc.proxy
+import nova.conf
+from nova import exception as exc
+from nova.objects import base as objects_base
+from nova import profiler
+from nova import rpc
 
-rpcapi_opts = [
-    cfg.StrOpt('scheduler_topic',
-               default='scheduler',
-               help='the topic scheduler nodes listen on'),
-]
-
-CONF = cfg.CONF
-CONF.register_opts(rpcapi_opts)
-
-rpcapi_cap_opt = cfg.StrOpt('scheduler',
-        default=None,
-        help='Set a version cap for messages sent to scheduler services')
-CONF.register_opt(rpcapi_cap_opt, 'upgrade_levels')
+CONF = nova.conf.CONF
+RPC_TOPIC = "scheduler"
 
 
-class SchedulerAPI(nova.openstack.common.rpc.proxy.RpcProxy):
+@profiler.trace_cls("rpc")
+class SchedulerAPI(object):
     '''Client side of the scheduler rpc API.
 
     API version history:
 
-        1.0 - Initial version.
-        1.1 - Changes to prep_resize():
-                - remove instance_uuid, add instance
-                - remove instance_type_id, add instance_type
-                - remove topic, it was unused
-        1.2 - Remove topic from run_instance, it was unused
-        1.3 - Remove instance_id, add instance to live_migration
-        1.4 - Remove update_db from prep_resize
-        1.5 - Add reservations argument to prep_resize()
-        1.6 - Remove reservations argument to run_instance()
-        1.7 - Add create_volume() method, remove topic from live_migration()
+        * 1.0 - Initial version.
+        * 1.1 - Changes to prep_resize():
+            * remove instance_uuid, add instance
+            * remove instance_type_id, add instance_type
+            * remove topic, it was unused
+        * 1.2 - Remove topic from run_instance, it was unused
+        * 1.3 - Remove instance_id, add instance to live_migration
+        * 1.4 - Remove update_db from prep_resize
+        * 1.5 - Add reservations argument to prep_resize()
+        * 1.6 - Remove reservations argument to run_instance()
+        * 1.7 - Add create_volume() method, remove topic from live_migration()
 
-        2.0 - Remove 1.x backwards compat
-        2.1 - Add image_id to create_volume()
-        2.2 - Remove reservations argument to create_volume()
-        2.3 - Remove create_volume()
-        2.4 - Change update_service_capabilities()
-                - accepts a list of capabilities
-        2.5 - Add get_backdoor_port()
-        2.6 - Add select_hosts()
+        * 2.0 - Remove 1.x backwards compat
+        * 2.1 - Add image_id to create_volume()
+        * 2.2 - Remove reservations argument to create_volume()
+        * 2.3 - Remove create_volume()
+        * 2.4 - Change update_service_capabilities()
+            * accepts a list of capabilities
+        * 2.5 - Add get_backdoor_port()
+        * 2.6 - Add select_hosts()
 
         ... Grizzly supports message version 2.6.  So, any changes to existing
         methods in 2.x after that point should be done such that they can
         handle the version_cap being set to 2.6.
 
-        2.7 - Add select_destinations()
-    '''
+        * 2.7 - Add select_destinations()
+        * 2.8 - Deprecate prep_resize() -- JUST KIDDING.  It is still used
+                by the compute manager for retries.
+        * 2.9 - Added the legacy_bdm_in_spec parameter to run_instance()
 
-    #
-    # NOTE(russellb): This is the default minimum version that the server
-    # (manager) side must implement unless otherwise specified using a version
-    # argument to self.call()/cast()/etc. here.  It should be left as X.0 where
-    # X is the current major API version (1.0, 2.0, ...).  For more information
-    # about rpc API versioning, see the docs in
-    # openstack/common/rpc/dispatcher.py.
-    #
-    BASE_RPC_API_VERSION = '2.0'
+        ... Havana supports message version 2.9.  So, any changes to existing
+        methods in 2.x after that point should be done such that they can
+        handle the version_cap being set to 2.9.
+
+        * Deprecated live_migration() call, moved to conductor
+        * Deprecated select_hosts()
+
+        3.0 - Removed backwards compat
+
+        ... Icehouse and Juno support message version 3.0.  So, any changes to
+        existing methods in 3.x after that point should be done such that they
+        can handle the version_cap being set to 3.0.
+
+        * 3.1 - Made select_destinations() send flavor object
+
+        * 4.0 - Removed backwards compat for Icehouse
+        * 4.1 - Add update_aggregates() and delete_aggregate()
+        * 4.2 - Added update_instance_info(), delete_instance_info(), and
+                sync_instance_info()  methods
+
+        ... Kilo and Liberty support message version 4.2. So, any
+        changes to existing methods in 4.x after that point should be
+        done such that they can handle the version_cap being set to
+        4.2.
+
+        * 4.3 - Modify select_destinations() signature by providing a
+                RequestSpec obj
+
+        ... Mitaka, Newton, and Ocata support message version 4.3. So, any
+        changes to existing methods in 4.x after that point should be done such
+        that they can handle the version_cap being set to 4.3.
+
+        * 4.4 - Modify select_destinations() signature by providing the
+                instance_uuids for the request.
+
+        ... Pike supports message version 4.4. So any changes to existing
+        methods in 4.x after that point should be done such
+        that they can handle the version_cap being set to 4.4.
+
+        * 4.5 - Modify select_destinations() to optionally return a list of
+                lists of Selection objects, along with zero or more alternates.
+    '''
 
     VERSION_ALIASES = {
         'grizzly': '2.6',
+        'havana': '2.9',
+        'icehouse': '3.0',
+        'juno': '3.0',
+        'kilo': '4.2',
+        'liberty': '4.2',
+        'mitaka': '4.3',
+        'newton': '4.3',
+        'ocata': '4.3',
+        'pike': '4.4',
     }
 
     def __init__(self):
+        super(SchedulerAPI, self).__init__()
+        target = messaging.Target(topic=RPC_TOPIC, version='4.0')
         version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.scheduler,
                                                CONF.upgrade_levels.scheduler)
-        super(SchedulerAPI, self).__init__(topic=CONF.scheduler_topic,
-                default_version=self.BASE_RPC_API_VERSION,
-                version_cap=version_cap)
+        serializer = objects_base.NovaObjectSerializer()
+        self.client = rpc.get_client(target, version_cap=version_cap,
+                                     serializer=serializer)
 
-    def select_destinations(self, ctxt, request_spec, filter_properties):
-        return self.call(ctxt, self.make_msg('select_destinations',
-            request_spec=request_spec, filter_properties=filter_properties),
-            version='2.7')
+    def select_destinations(self, ctxt, spec_obj, instance_uuids,
+            return_objects=False, return_alternates=False):
+        # Modify the parameters if an older version is requested
+        version = '4.5'
+        msg_args = {'instance_uuids': instance_uuids,
+                    'spec_obj': spec_obj,
+                    'return_objects': return_objects,
+                    'return_alternates': return_alternates}
+        if not self.client.can_send_version(version):
+            if msg_args['return_objects'] or msg_args['return_alternates']:
+                # The client is requesting an RPC version we can't support.
+                raise exc.SelectionObjectsWithOldRPCVersionNotSupported(
+                        version=self.client.version_cap)
+            del msg_args['return_objects']
+            del msg_args['return_alternates']
+            version = '4.4'
+        if not self.client.can_send_version(version):
+            del msg_args['instance_uuids']
+            version = '4.3'
+        if not self.client.can_send_version(version):
+            del msg_args['spec_obj']
+            msg_args['request_spec'] = spec_obj.to_legacy_request_spec_dict()
+            msg_args['filter_properties'
+                     ] = spec_obj.to_legacy_filter_properties_dict()
+            version = '4.0'
+        cctxt = self.client.prepare(version=version)
+        return cctxt.call(ctxt, 'select_destinations', **msg_args)
 
-    def run_instance(self, ctxt, request_spec, admin_password,
-            injected_files, requested_networks, is_first_time,
-            filter_properties):
-        return self.cast(ctxt, self.make_msg('run_instance',
-                request_spec=request_spec, admin_password=admin_password,
-                injected_files=injected_files,
-                requested_networks=requested_networks,
-                is_first_time=is_first_time,
-                filter_properties=filter_properties))
+    def update_aggregates(self, ctxt, aggregates):
+        # NOTE(sbauza): Yes, it's a fanout, we need to update all schedulers
+        cctxt = self.client.prepare(fanout=True, version='4.1')
+        cctxt.cast(ctxt, 'update_aggregates', aggregates=aggregates)
 
-    def prep_resize(self, ctxt, instance, instance_type, image,
-            request_spec, filter_properties, reservations):
-        instance_p = jsonutils.to_primitive(instance)
-        instance_type_p = jsonutils.to_primitive(instance_type)
-        reservations_p = jsonutils.to_primitive(reservations)
-        image_p = jsonutils.to_primitive(image)
-        self.cast(ctxt, self.make_msg('prep_resize',
-                instance=instance_p, instance_type=instance_type_p,
-                image=image_p, request_spec=request_spec,
-                filter_properties=filter_properties,
-                reservations=reservations_p))
+    def delete_aggregate(self, ctxt, aggregate):
+        # NOTE(sbauza): Yes, it's a fanout, we need to update all schedulers
+        cctxt = self.client.prepare(fanout=True, version='4.1')
+        cctxt.cast(ctxt, 'delete_aggregate', aggregate=aggregate)
 
-    def live_migration(self, ctxt, block_migration, disk_over_commit,
-            instance, dest):
-        # NOTE(comstud): Call vs cast so we can get exceptions back, otherwise
-        # this call in the scheduler driver doesn't return anything.
-        instance_p = jsonutils.to_primitive(instance)
-        return self.call(ctxt, self.make_msg('live_migration',
-                block_migration=block_migration,
-                disk_over_commit=disk_over_commit, instance=instance_p,
-                dest=dest))
+    def update_instance_info(self, ctxt, host_name, instance_info):
+        cctxt = self.client.prepare(version='4.2', fanout=True)
+        return cctxt.cast(ctxt, 'update_instance_info', host_name=host_name,
+                          instance_info=instance_info)
 
-    def update_service_capabilities(self, ctxt, service_name, host,
-            capabilities):
-        self.fanout_cast(ctxt, self.make_msg('update_service_capabilities',
-                service_name=service_name, host=host,
-                capabilities=capabilities),
-                version='2.4')
+    def delete_instance_info(self, ctxt, host_name, instance_uuid):
+        cctxt = self.client.prepare(version='4.2', fanout=True)
+        return cctxt.cast(ctxt, 'delete_instance_info', host_name=host_name,
+                          instance_uuid=instance_uuid)
 
-    def select_hosts(self, ctxt, request_spec, filter_properties):
-        return self.call(ctxt, self.make_msg('select_hosts',
-                request_spec=request_spec,
-                filter_properties=filter_properties),
-                version='2.6')
+    def sync_instance_info(self, ctxt, host_name, instance_uuids):
+        cctxt = self.client.prepare(version='4.2', fanout=True)
+        return cctxt.cast(ctxt, 'sync_instance_info', host_name=host_name,
+                          instance_uuids=instance_uuids)

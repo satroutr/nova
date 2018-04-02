@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -24,3 +22,14 @@
    :platform: Unix
    :synopsis: Infrastructure-as-a-Service Cloud platform.
 """
+
+import os
+
+os.environ['EVENTLET_NO_GREENDNS'] = 'yes'
+
+# NOTE(rpodolyaka): import oslo_service first, so that it makes eventlet hub
+# use a monotonic clock to avoid issues with drifts of system time (see
+# LP 1510234 for details)
+import oslo_service  # noqa
+
+import eventlet  # noqa

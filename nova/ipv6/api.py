@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 OpenStack Foundation
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -14,24 +12,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo.config import cfg
+from stevedore import driver
 
-from nova import utils
+import nova.conf
 
-ipv6_backend_opt = cfg.StrOpt('ipv6_backend',
-                              default='rfc2462',
-                              help='Backend to use for IPv6 generation')
-
-CONF = cfg.CONF
-CONF.register_opt(ipv6_backend_opt)
+CONF = nova.conf.CONF
 IMPL = None
 
 
 def reset_backend():
     global IMPL
-    IMPL = utils.LazyPluggable('ipv6_backend',
-               rfc2462='nova.ipv6.rfc2462',
-               account_identifier='nova.ipv6.account_identifier')
+    IMPL = driver.DriverManager("nova.ipv6_backend",
+                                CONF.ipv6_backend).driver
 
 
 def to_global(prefix, mac, project_id):

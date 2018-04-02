@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -16,7 +14,6 @@
 #    under the License.
 
 import copy
-import os
 
 from nova.api.openstack import common
 
@@ -29,14 +26,13 @@ def get_view_builder(req):
 class ViewBuilder(common.ViewBuilder):
 
     def __init__(self, base_url):
-        """
-        :param base_url: url of the root wsgi application
-        """
+        """:param base_url: url of the root wsgi application."""
+        self.prefix = self._update_compute_link_prefix(base_url)
         self.base_url = base_url
 
     def build_choices(self, VERSIONS, req):
         version_objs = []
-        for version in VERSIONS:
+        for version in sorted(VERSIONS):
             version = VERSIONS[version]
             version_objs.append({
                 "id": version['id'],
@@ -44,7 +40,7 @@ class ViewBuilder(common.ViewBuilder):
                 "links": [
                     {
                         "rel": "self",
-                        "href": self.generate_href(req.path),
+                        "href": self.generate_href(version['id'], req.path),
                     },
                 ],
                 "media-types": version['media-types'],
@@ -59,6 +55,8 @@ class ViewBuilder(common.ViewBuilder):
             version_objs.append({
                 "id": version['id'],
                 "status": version['status'],
+                "version": version['version'],
+                "min_version": version['min_version'],
                 "updated": version['updated'],
                 "links": self._build_links(version),
             })
@@ -69,13 +67,13 @@ class ViewBuilder(common.ViewBuilder):
         reval = copy.deepcopy(version)
         reval['links'].insert(0, {
             "rel": "self",
-            "href": self.base_url.rstrip('/') + '/',
+            "href": self.prefix.rstrip('/') + '/',
         })
         return dict(version=reval)
 
     def _build_links(self, version_data):
         """Generate a container of links that refer to the provided version."""
-        href = self.generate_href()
+        href = self.generate_href(version_data['id'])
 
         links = [
             {
@@ -86,12 +84,12 @@ class ViewBuilder(common.ViewBuilder):
 
         return links
 
-    def generate_href(self, path=None):
+    def generate_href(self, version, path=None):
         """Create an url that refers to a specific version_number."""
-        prefix = self._update_compute_link_prefix(self.base_url)
-        version_number = 'v2'
-        if path:
-            path = path.strip('/')
-            return os.path.join(prefix, version_number, path)
+        if version.find('v2.1') == 0:
+            version_number = 'v2.1'
         else:
-            return os.path.join(prefix, version_number) + '/'
+            version_number = 'v2'
+
+        path = path or ''
+        return common.url_join(self.prefix, version_number, path)

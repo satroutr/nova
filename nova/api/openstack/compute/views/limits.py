@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010-2011 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -15,35 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
-
-from nova.openstack.common import timeutils
-
 
 class ViewBuilder(object):
     """OpenStack API base limits view builder."""
 
-    def build(self, rate_limits, absolute_limits):
-        rate_limits = self._build_rate_limits(rate_limits)
-        absolute_limits = self._build_absolute_limits(absolute_limits)
+    limit_names = {}
 
-        output = {
-            "limits": {
-                "rate": rate_limits,
-                "absolute": absolute_limits,
-            },
-        }
-
-        return output
-
-    def _build_absolute_limits(self, absolute_limits):
-        """Builder for absolute limits
-
-        absolute_limits should be given as a dict of limits.
-        For example: {"ram": 512, "gigabytes": 1024}.
-
-        """
-        limit_names = {
+    def __init__(self):
+        self.limit_names = {
             "ram": ["maxTotalRAMSize"],
             "instances": ["maxTotalInstances"],
             "cores": ["maxTotalCores"],
@@ -54,47 +31,42 @@ class ViewBuilder(object):
             "injected_file_content_bytes": ["maxPersonalitySize"],
             "security_groups": ["maxSecurityGroups"],
             "security_group_rules": ["maxSecurityGroupRules"],
+            "server_groups": ["maxServerGroups"],
+            "server_group_members": ["maxServerGroupMembers"]
+    }
+
+    def build(self, absolute_limits, filtered_limits=None,
+              max_image_meta=True):
+        absolute_limits = self._build_absolute_limits(
+            absolute_limits, filtered_limits,
+            max_image_meta=max_image_meta)
+
+        output = {
+            "limits": {
+                "rate": [],
+                "absolute": absolute_limits,
+            },
         }
+
+        return output
+
+    def _build_absolute_limits(self, absolute_limits, filtered_limits=None,
+                               max_image_meta=True):
+        """Builder for absolute limits
+
+        absolute_limits should be given as a dict of limits.
+        For example: {"ram": 512, "gigabytes": 1024}.
+
+        filtered_limits is an optional list of limits to exclude from the
+        result set.
+        """
+        filtered_limits = filtered_limits or []
         limits = {}
-        for name, value in absolute_limits.iteritems():
-            if name in limit_names and value is not None:
-                for name in limit_names[name]:
-                    limits[name] = value
+        for name, value in absolute_limits.items():
+            if (name in self.limit_names and
+                    value is not None and name not in filtered_limits):
+                for limit_name in self.limit_names[name]:
+                    if not max_image_meta and limit_name == "maxImageMeta":
+                        continue
+                    limits[limit_name] = value
         return limits
-
-    def _build_rate_limits(self, rate_limits):
-        limits = []
-        for rate_limit in rate_limits:
-            _rate_limit_key = None
-            _rate_limit = self._build_rate_limit(rate_limit)
-
-            # check for existing key
-            for limit in limits:
-                if (limit["uri"] == rate_limit["URI"] and
-                        limit["regex"] == rate_limit["regex"]):
-                    _rate_limit_key = limit
-                    break
-
-            # ensure we have a key if we didn't find one
-            if not _rate_limit_key:
-                _rate_limit_key = {
-                    "uri": rate_limit["URI"],
-                    "regex": rate_limit["regex"],
-                    "limit": [],
-                }
-                limits.append(_rate_limit_key)
-
-            _rate_limit_key["limit"].append(_rate_limit)
-
-        return limits
-
-    def _build_rate_limit(self, rate_limit):
-        _get_utc = datetime.datetime.utcfromtimestamp
-        next_avail = _get_utc(rate_limit["resetTime"])
-        return {
-            "verb": rate_limit["verb"],
-            "value": rate_limit["value"],
-            "remaining": int(rate_limit["remaining"]),
-            "unit": rate_limit["unit"],
-            "next-available": timeutils.isotime(at=next_avail),
-        }

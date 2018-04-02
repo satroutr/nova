@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2012 Red Hat, Inc.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,19 +14,13 @@
 
 import sys
 
-from oslo.config import cfg
+from oslo_log import log as logging
+from oslo_utils import importutils
 
-from nova.openstack.common import importutils
-from nova.openstack.common import log as logging
+import nova.conf
 
-driver_opts = [
-    cfg.StrOpt('network_driver',
-               default='nova.network.linux_net',
-               help='Driver to use for network creation'),
-]
-CONF = cfg.CONF
-CONF.register_opts(driver_opts)
 
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 
@@ -37,9 +29,9 @@ def load_network_driver(network_driver=None):
         network_driver = CONF.network_driver
 
     if not network_driver:
-        LOG.error(_("Network driver option required, but not specified"))
+        LOG.error("Network driver option required, but not specified")
         sys.exit(1)
 
-    LOG.info(_("Loading network driver '%s'") % network_driver)
+    LOG.info("Loading network driver '%s'", network_driver)
 
     return importutils.import_module(network_driver)

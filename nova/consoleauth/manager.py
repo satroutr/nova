@@ -1,6 +1,4 @@
 #!/usr/bin/env python
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2012 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -20,46 +18,56 @@
 
 import time
 
-from oslo.config import cfg
+from oslo_log import log as logging
+import oslo_messaging as messaging
+from oslo_serialization import jsonutils
 
+from nova import cache_utils
 from nova.cells import rpcapi as cells_rpcapi
 from nova.compute import rpcapi as compute_rpcapi
+import nova.conf
+from nova import context as nova_context
 from nova import manager
-from nova.openstack.common import jsonutils
-from nova.openstack.common import log as logging
-from nova.openstack.common import memorycache
+from nova import objects
 
 
 LOG = logging.getLogger(__name__)
 
-consoleauth_opts = [
-    cfg.IntOpt('console_token_ttl',
-               default=600,
-               help='How many seconds before deleting tokens'),
-    cfg.StrOpt('consoleauth_manager',
-               default='nova.consoleauth.manager.ConsoleAuthManager',
-               help='Manager for console auth'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(consoleauth_opts)
-CONF.import_opt('enable', 'nova.cells.opts', group='cells')
+CONF = nova.conf.CONF
 
 
 class ConsoleAuthManager(manager.Manager):
     """Manages token based authentication."""
 
-    RPC_API_VERSION = '1.2'
+    target = messaging.Target(version='2.1')
 
     def __init__(self, scheduler_driver=None, *args, **kwargs):
         super(ConsoleAuthManager, self).__init__(service_name='consoleauth',
                                                  *args, **kwargs)
-        self.mc = memorycache.get_client()
+        self._mc = None
+        self._mc_instance = None
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         self.cells_rpcapi = cells_rpcapi.CellsAPI()
 
+    @property
+    def mc(self):
+        if self._mc is None:
+            self._mc = cache_utils.get_client(CONF.consoleauth.token_ttl)
+        return self._mc
+
+    @property
+    def mc_instance(self):
+        if self._mc_instance is None:
+            self._mc_instance = cache_utils.get_client()
+        return self._mc_instance
+
+    def reset(self):
+        LOG.info('Reloading compute RPC API')
+        compute_rpcapi.LAST_VERSION = None
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
+
     def _get_tokens_for_instance(self, instance_uuid):
-        tokens_str = self.mc.get(instance_uuid.encode('UTF-8'))
+        tokens_str = self.mc_instance.get(instance_uuid.encode('UTF-8'))
         if not tokens_str:
             tokens = []
         else:
@@ -67,7 +75,8 @@ class ConsoleAuthManager(manager.Manager):
         return tokens
 
     def authorize_console(self, context, token, console_type, host, port,
-                          internal_access_path, instance_uuid=None):
+                          internal_access_path, instance_uuid,
+                          access_url=None):
 
         token_dict = {'token': token,
                       'instance_uuid': instance_uuid,
@@ -75,16 +84,25 @@ class ConsoleAuthManager(manager.Manager):
                       'host': host,
                       'port': port,
                       'internal_access_path': internal_access_path,
+                      'access_url': access_url,
                       'last_activity_at': time.time()}
         data = jsonutils.dumps(token_dict)
-        self.mc.set(token.encode('UTF-8'), data, CONF.console_token_ttl)
-        if instance_uuid is not None:
-            tokens = self._get_tokens_for_instance(instance_uuid)
-            tokens.append(token)
-            self.mc.set(instance_uuid.encode('UTF-8'),
-                        jsonutils.dumps(tokens))
 
-        LOG.audit(_("Received Token: %(token)s, %(token_dict)s)"), locals())
+        self.mc.set(token.encode('UTF-8'), data)
+        tokens = self._get_tokens_for_instance(instance_uuid)
+
+        # Remove the expired tokens from cache.
+        token_values = self.mc.get_multi(
+            [tok.encode('UTF-8') for tok in tokens])
+        tokens = [name for name, value in zip(tokens, token_values)
+                  if value is not None]
+        tokens.append(token)
+
+        self.mc_instance.set(instance_uuid.encode('UTF-8'),
+                             jsonutils.dumps(tokens))
+
+        LOG.info("Received Token: %(token)s, %(token_dict)s",
+                 {'token': token, 'token_dict': token_dict})
 
     def _validate_token(self, context, token):
         instance_uuid = token['instance_uuid']
@@ -98,17 +116,22 @@ class ConsoleAuthManager(manager.Manager):
             return self.cells_rpcapi.validate_console_port(context,
                     instance_uuid, token['port'], token['console_type'])
 
-        instance = self.db.instance_get_by_uuid(context, instance_uuid)
+        mapping = objects.InstanceMapping.get_by_instance_uuid(context,
+                                                               instance_uuid)
+        with nova_context.target_cell(context, mapping.cell_mapping) as cctxt:
+            instance = objects.Instance.get_by_uuid(cctxt, instance_uuid)
 
-        return self.compute_rpcapi.validate_console_port(context,
-                                            instance,
-                                            token['port'],
-                                            token['console_type'])
+            return self.compute_rpcapi.validate_console_port(
+                cctxt,
+                instance,
+                token['port'],
+                token['console_type'])
 
     def check_token(self, context, token):
         token_str = self.mc.get(token.encode('UTF-8'))
         token_valid = (token_str is not None)
-        LOG.audit(_("Checking Token: %(token)s, %(token_valid)s)"), locals())
+        LOG.info("Checking Token: %(token)s, %(token_valid)s",
+                 {'token': token, 'token_valid': token_valid})
         if token_valid:
             token = jsonutils.loads(token_str)
             if self._validate_token(context, token):
@@ -116,11 +139,6 @@ class ConsoleAuthManager(manager.Manager):
 
     def delete_tokens_for_instance(self, context, instance_uuid):
         tokens = self._get_tokens_for_instance(instance_uuid)
-        for token in tokens:
-            self.mc.delete(token.encode('UTF-8'))
-        self.mc.delete(instance_uuid.encode('UTF-8'))
-
-    # NOTE(russellb) This method can be removed in 2.0 of this API.  It is
-    # deprecated in favor of the method in the base API.
-    def get_backdoor_port(self, context):
-        return self.backdoor_port
+        self.mc.delete_multi(
+                [tok.encode('UTF-8') for tok in tokens])
+        self.mc_instance.delete(instance_uuid.encode('UTF-8'))
